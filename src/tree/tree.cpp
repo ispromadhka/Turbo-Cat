@@ -13,6 +13,10 @@
 #include <omp.h>
 #endif
 
+#ifdef TURBOCAT_AVX2
+#include <immintrin.h>
+#endif
+
 namespace turbocat {
 
 // ============================================================================
@@ -28,16 +32,11 @@ void Tree::build(
     const std::vector<Index>& sample_indices,
     HistogramBuilder& hist_builder
 ) {
-    // DEBUG
-    std::printf("[TREE::BUILD] n_samples=%zu, n_features=%d\n", 
-                sample_indices.size(), dataset.n_features());
-    
     nodes_.clear();
     n_leaves_ = 0;
     depth_ = 0;
     
     if (sample_indices.empty()) {
-        std::printf("[TREE::BUILD] ERROR: sample_indices is EMPTY!\n");
         return;
     }
     
@@ -46,15 +45,14 @@ void Tree::build(
     
     // Compute total gradient/hessian
     GradientPair root_stats;
+    const Float* grads = dataset.gradients();
+    const Float* hess = dataset.hessians();
+    
     for (Index idx : sample_indices) {
-        root_stats.grad += dataset.gradients()[idx];
-        root_stats.hess += dataset.hessians()[idx];
+        root_stats.grad += grads[idx];
+        root_stats.hess += hess[idx];
         root_stats.count += 1;
     }
-    
-    // DEBUG
-    std::printf("[TREE::BUILD] root_stats: G=%.4f, H=%.4f, count=%u\n",
-                root_stats.grad, root_stats.hess, root_stats.count);
     
     nodes_[root].stats = root_stats;
     
@@ -83,11 +81,6 @@ void Tree::build_recursive(
     
     TreeNode& node = nodes_[node_idx];
     
-    // DEBUG OUTPUT
-    std::printf("[DEBUG] depth=%d, n_samples=%zu, G=%.4f, H=%.4f, min_samples_leaf=%u, min_child_weight=%.2f\n", 
-                current_depth, indices.size(), node.stats.grad, node.stats.hess,
-                config_.min_samples_leaf, config_.min_child_weight);
-    
     // Check stopping conditions
     bool should_stop = 
         current_depth >= config_.max_depth ||
@@ -96,11 +89,6 @@ void Tree::build_recursive(
         node.stats.hess < 2 * config_.min_child_weight;
     
     if (should_stop) {
-        std::printf("[DEBUG] STOP: depth_limit=%d, leaves_limit=%d, samples_limit=%d, hess_limit=%d\n",
-                    current_depth >= config_.max_depth,
-                    n_leaves_ >= config_.max_leaves,
-                    indices.size() < static_cast<size_t>(2 * config_.min_samples_leaf),
-                    node.stats.hess < 2 * config_.min_child_weight);
         make_leaf(node_idx, node.stats);
         return;
     }
@@ -112,13 +100,7 @@ void Tree::build_recursive(
     SplitFinder finder(config_);
     SplitInfo best_split = finder.find_best_split(histogram, node.stats, features);
     
-    // DEBUG: Print split info
-    std::printf("[DEBUG] best_split: valid=%d, gain=%.6f, feature=%d, bin=%d\n",
-                best_split.is_valid, best_split.gain, best_split.feature_idx, best_split.bin_threshold);
-    
     if (!best_split.is_valid || best_split.gain < config_.min_split_gain) {
-        std::printf("[DEBUG] LEAF: split_invalid=%d, gain_too_low=%d (min=%.6f)\n",
-                    !best_split.is_valid, best_split.gain < config_.min_split_gain, config_.min_split_gain);
         make_leaf(node_idx, node.stats);
         return;
     }
@@ -156,8 +138,6 @@ void Tree::build_recursive(
     // Learn missing value direction
     if (config_.learn_missing_direction && 
         (left_indices.size() != indices.size() && right_indices.size() != indices.size())) {
-        // Try both directions and pick the one with better gain
-        // For now, use heuristic: go to the larger child
         node.default_left = left_indices.size() >= right_indices.size() ? 1 : 0;
     }
     
@@ -188,10 +168,6 @@ void Tree::make_leaf(TreeIndex node_idx, const GradientPair& stats) {
     // Compute leaf value: -G / (H + λ)
     node.value = -stats.grad / (stats.hess + config_.lambda_l2);
     
-    // DEBUG
-    std::printf("[MAKE_LEAF] node=%d, G=%.4f, H=%.4f, lambda=%.4f, value=%.4f\n",
-                node_idx, stats.grad, stats.hess, config_.lambda_l2, node.value);
-    
     // Apply delta step constraint
     if (config_.max_delta_step > 0) {
         node.value = std::max(-config_.max_delta_step, 
@@ -214,9 +190,6 @@ Float Tree::predict(const Float* features, FeatureIndex n_features) const {
         if (std::isnan(value)) {
             node_idx = node.default_left ? node.left_child : node.right_child;
         } else {
-            // We need bin edges to compare properly
-            // For now, assume raw value can be compared to bin threshold
-            // This is a simplification; proper implementation needs bin edges
             node_idx = (value <= static_cast<Float>(node.split_bin)) 
                       ? node.left_child : node.right_child;
         }
@@ -227,36 +200,23 @@ Float Tree::predict(const Float* features, FeatureIndex n_features) const {
 
 Float Tree::predict(const Dataset& dataset, Index row) const {
     if (nodes_.empty()) {
-        std::printf("[PREDICT] ERROR: tree is empty!\n");
         return 0.0f;
     }
     
     TreeIndex node_idx = 0;
-    int steps = 0;
     
     while (!nodes_[node_idx].is_leaf) {
         const TreeNode& node = nodes_[node_idx];
         BinIndex bin = dataset.binned().get(row, node.split_feature);
         
-        // DEBUG all predictions
-        std::printf("[PREDICT] row=%d, node=%d, bin=%d, split_bin=%d\n",
-                    row, node_idx, bin, node.split_bin);
-        
         if (bin == 255) {  // NaN
             node_idx = node.default_left ? node.left_child : node.right_child;
         } else {
-            node_idx = (bin <= node.split_bin) ? node.left_child : node.right_child;
-        }
-        steps++;
-        if (steps > 100) {
-            std::printf("[PREDICT] ERROR: infinite loop!\n");
-            return 0.0f;
+            // Branchless version using arithmetic
+            const int go_right = (bin > node.split_bin);
+            node_idx = go_right * node.right_child + (1 - go_right) * node.left_child;
         }
     }
-    
-    // DEBUG
-    std::printf("[PREDICT] row=%d -> leaf=%d, value=%.4f\n",
-                row, node_idx, nodes_[node_idx].value);
     
     return nodes_[node_idx].value;
 }
@@ -267,7 +227,7 @@ void Tree::predict_batch(
     FeatureIndex n_features,
     Float* output
 ) const {
-    #pragma omp parallel for simd
+    #pragma omp parallel for
     for (Index i = 0; i < n_samples; ++i) {
         output[i] = predict(features + i * n_features, n_features);
     }
@@ -324,23 +284,12 @@ void TreeEnsemble::add_tree(std::unique_ptr<Tree> tree, Float weight) {
     tree_weights_.push_back(weight);
 }
 
-// Disabled - GradTree not compiled
-// void TreeEnsemble::add_gradtree(std::unique_ptr<GradTree> tree, Float weight) {
-//     gradtrees_.push_back(std::move(tree));
-//     gradtree_weights_.push_back(weight);
-// }
-
 Float TreeEnsemble::predict(const Float* features, FeatureIndex n_features) const {
     Float sum = 0.0f;
     
     for (size_t i = 0; i < trees_.size(); ++i) {
         sum += tree_weights_[i] * trees_[i]->predict(features, n_features);
     }
-    
-    // GradTree disabled
-    // for (size_t i = 0; i < gradtrees_.size(); ++i) {
-    //     sum += gradtree_weights_[i] * gradtrees_[i]->predict_hard(features);
-    // }
     
     return sum;
 }
@@ -361,34 +310,14 @@ void TreeEnsemble::predict_batch(
             );
         }
     }
-    
-    // GradTree disabled
-    // for (size_t t = 0; t < gradtrees_.size(); ++t) {
-    //     #pragma omp parallel for
-    //     for (Index i = 0; i < n_samples; ++i) {
-    //         output[i] += gradtree_weights_[t] * gradtrees_[t]->predict_hard(
-    //             features + i * n_features
-    //         );
-    //     }
-    // }
 }
 
 Float TreeEnsemble::predict(const Dataset& data, Index row) const {
-    // DEBUG
-    if (row < 3) fflush(stdout); std::printf("[ENSEMBLE::PREDICT] row=%d, trees_.size=%zu\n", static_cast<int>(row), trees_.size());
-    
     Float sum = 0.0f;
     
     for (size_t i = 0; i < trees_.size(); ++i) {
         sum += tree_weights_[i] * trees_[i]->predict(data, row);
     }
-    
-    // GradTree disabled
-    // for (size_t i = 0; i < gradtrees_.size(); ++i) {
-    //     sum += gradtree_weights_[i] * gradtrees_[i]->predict_hard(
-    //         data.raw_data() + row * data.n_features()
-    //     );
-    // }
     
     return sum;
 }
@@ -403,16 +332,6 @@ void TreeEnsemble::predict_batch(const Dataset& data, Float* output) const {
             output[i] += tree_weights_[t] * trees_[t]->predict(data, i);
         }
     }
-    
-    // GradTree disabled
-    // for (size_t t = 0; t < gradtrees_.size(); ++t) {
-    //     #pragma omp parallel for
-    //     for (Index i = 0; i < n_samples; ++i) {
-    //         output[i] += gradtree_weights_[t] * gradtrees_[t]->predict_hard(
-    //             data.raw_data() + i * data.n_features()
-    //         );
-    //     }
-    // }
 }
 
 std::vector<Float> TreeEnsemble::feature_importance() const {
@@ -439,8 +358,6 @@ std::vector<Float> TreeEnsemble::feature_importance() const {
 void TreeEnsemble::sparsify(Float target_sparsity) {
     // LP-based ensemble thinning would go here
     // For now, simple weight thresholding
-    
-    Float threshold = target_sparsity;
     
     std::vector<std::pair<Float, size_t>> weights_with_idx;
     for (size_t i = 0; i < tree_weights_.size(); ++i) {

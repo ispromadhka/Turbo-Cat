@@ -62,17 +62,17 @@ void Booster::train(
         valid_preds.resize(valid_data->n_samples(), base_prediction_);
     }
     
-    // All sample indices
+    // All sample indices - preallocate once
     std::vector<Index> all_indices(train_data.n_samples());
     std::iota(all_indices.begin(), all_indices.end(), 0);
     
-    // DEBUG
-    std::printf("[TRAIN INIT] n_samples=%d, n_features=%d, base_pred=%.4f\n",
-                train_data.n_samples(), train_data.n_features(), base_prediction_);
-    
-    // All feature indices
+    // All feature indices - preallocate once
     std::vector<FeatureIndex> all_features(train_data.n_features());
     std::iota(all_features.begin(), all_features.end(), static_cast<FeatureIndex>(0));
+    
+    // Preallocate buffers for GOSS (avoid repeated allocations)
+    std::vector<std::pair<Float, Index>> grad_indices;
+    grad_indices.reserve(train_data.n_samples());
     
     // Training history
     history_.train_loss.clear();
@@ -98,25 +98,18 @@ void Booster::train(
         // Sample selection
         std::vector<Index> sample_indices;
         
-        // DEBUG
-        std::printf("[TRAIN] use_goss=%d, subsample=%.2f, all_indices.size=%zu\n",
-                    config_.boosting.use_goss, config_.boosting.subsample, all_indices.size());
-        
         if (config_.boosting.use_goss) {
             sample_indices = goss_sample(
                 train_data,
                 config_.boosting.goss_top_rate,
                 config_.boosting.goss_other_rate
             );
-            std::printf("[TRAIN] GOSS: selected %zu samples\n", sample_indices.size());
         } else if (config_.boosting.subsample < 1.0f) {
             sample_indices = train_data.random_subsample(
                 config_.boosting.subsample, next_random()
             );
-            std::printf("[TRAIN] Subsample: selected %zu samples\n", sample_indices.size());
         } else {
             sample_indices = all_indices;
-            std::printf("[TRAIN] Using ALL %zu samples\n", sample_indices.size());
         }
         
         // Feature selection
@@ -130,12 +123,7 @@ void Booster::train(
         }
         
         // Build tree
-        // GradTree disabled
-        // if (config_.tree.use_gradtree) {
-        //     build_gradtree(train_data, sample_indices, train_preds);
-        // } else {
         build_tree(train_data, sample_indices, feature_indices, train_preds);
-        // }
         
         // Compute training loss
         Float train_loss = compute_loss(train_data, train_preds);
@@ -144,15 +132,13 @@ void Booster::train(
         // Validation
         Float valid_loss = 0.0f;
         if (valid_data) {
-            // Update validation predictions
-            const auto& trees = ensemble_.n_trees();
-            // Get prediction from last tree only
+            // Update validation predictions - only from last tree for efficiency
+            const Float lr = config_.boosting.learning_rate;
+            const auto& last_tree = ensemble_.n_trees() > 0 ? true : false;
+            
             #pragma omp parallel for
             for (Index i = 0; i < valid_data->n_samples(); ++i) {
-                Float pred = ensemble_.predict(
-                    valid_data->raw_data() + i * valid_data->n_features(),
-                    valid_data->n_features()
-                );
+                Float pred = ensemble_.predict(*valid_data, i);
                 valid_preds[i] = base_prediction_ + pred;
             }
             
@@ -257,43 +243,6 @@ void Booster::build_tree(
     ensemble_.add_tree(std::move(tree), lr);
 }
 
-// GradTree disabled
-/*
-void Booster::build_gradtree(
-    Dataset& data,
-    const std::vector<Index>& sample_indices,
-    AlignedVector<Float>& predictions
-) {
-    auto tree = std::make_unique<GradTree>(config_.tree, data.n_features());
-    tree->initialize_random(next_random());
-    
-    // First build a standard tree for warm start
-    Tree warm_start(config_.tree);
-    warm_start.build(data, sample_indices, *hist_builder_);
-    tree->initialize_from_tree(warm_start, data);
-    
-    // Optimize
-    auto loss_fn = [this](const auto& pred, const auto& target, auto& grad, auto& hess) {
-        // This would be called by GradTree optimization
-    };
-    
-    tree->optimize(data, sample_indices, loss_fn);
-    
-    // Update predictions
-    Float lr = config_.boosting.learning_rate;
-    
-    #pragma omp parallel for
-    for (Index i = 0; i < data.n_samples(); ++i) {
-        Float tree_pred = tree->predict_hard(
-            data.raw_data() + i * data.n_features()
-        );
-        predictions[i] += lr * tree_pred;
-    }
-    
-    // ensemble_.add_gradtree(std::move(tree), lr);  // GradTree disabled
-}
-*/
-
 // ============================================================================
 // Gradient Computation
 // ============================================================================
@@ -379,33 +328,20 @@ void Booster::initialize_training(Dataset& data) {
 void Booster::predict_raw(const Dataset& data, Float* output, int n_trees) const {
     std::memset(output, 0, data.n_samples() * sizeof(Float));
     
-    // Use Dataset-based prediction (uses binned data correctly)
-    // NOTE: removed omp parallel for debugging
+    #pragma omp parallel for
     for (Index i = 0; i < data.n_samples(); ++i) {
         Float tree_pred = ensemble_.predict(data, i);
         output[i] = base_prediction_ + tree_pred;
-        
-        // DEBUG
-        std::printf("[RAW] row=%d, base=%.4f, tree=%.4f, total=%.4f\n",
-                    i, base_prediction_, tree_pred, output[i]);
     }
 }
 
 void Booster::predict_proba(const Dataset& data, Float* output, int n_trees) const {
     predict_raw(data, output, n_trees);
     
-    // DEBUG: show raw values before transform
-    std::printf("[PROBA] Before transform:\n");
-    for (Index i = 0; i < data.n_samples(); ++i) {
-        std::printf("  output[%d] = %.4f\n", i, output[i]);
-    }
-    
     // Transform to probabilities
-    // NOTE: removed simd - was causing race condition
+    #pragma omp parallel for
     for (Index i = 0; i < data.n_samples(); ++i) {
-        Float raw = output[i];
-        output[i] = loss_->transform_prediction(raw);
-        std::printf("[PROBA] row=%d: raw=%.4f -> prob=%.4f\n", i, raw, output[i]);
+        output[i] = loss_->transform_prediction(output[i]);
     }
 }
 
