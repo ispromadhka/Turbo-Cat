@@ -45,6 +45,9 @@ void Histogram::subtract_from(const Histogram& parent, const Histogram& other) {
 // CPU Histogram Builder
 // ============================================================================
 
+// Minimum samples to use parallel processing (avoid thread overhead)
+static constexpr size_t MIN_SAMPLES_FOR_PARALLEL = 2000;
+
 CPUHistogramBuilder::CPUHistogramBuilder(int n_threads, bool use_simd)
     : n_threads_(n_threads), use_simd_(use_simd) {
     if (n_threads_ <= 0) {
@@ -64,91 +67,85 @@ void CPUHistogramBuilder::build(
 ) {
     output.clear();
     
-    const auto& features = feature_indices.empty() 
-        ? std::vector<FeatureIndex>() // Will iterate all
-        : feature_indices;
-    
     FeatureIndex n_features = dataset.n_features();
+    const Float* gradients = dataset.gradients();
+    const Float* hessians = dataset.hessians();
     
-    // For small sample sets, use single-threaded scalar version
-    if (sample_indices.size() < 1000 || n_threads_ == 1) {
+    // Build list of features to process
+    std::vector<FeatureIndex> features_to_process;
+    if (feature_indices.empty()) {
+        features_to_process.resize(n_features);
         for (FeatureIndex f = 0; f < n_features; ++f) {
-            if (!features.empty() && 
-                std::find(features.begin(), features.end(), f) == features.end()) {
-                continue;
-            }
-            
-            build_feature_scalar(
-                dataset.binned().column(f),
-                dataset.gradients(),
-                dataset.hessians(),
-                sample_indices,
-                output.bins(f)
-            );
+            features_to_process[f] = f;
         }
-        return;
+    } else {
+        features_to_process = feature_indices;
     }
     
-    // Multi-threaded with thread-local histograms
-    thread_histograms_.resize(n_threads_);
-    for (auto& h : thread_histograms_) {
-        h = Histogram(n_features, output.max_bins());
-        h.clear();
-    }
-    
-    #pragma omp parallel num_threads(n_threads_)
-    {
-        #ifdef _OPENMP
-        int tid = omp_get_thread_num();
-        #else
-        int tid = 0;
-        #endif
-        
-        auto& local_hist = thread_histograms_[tid];
-        
-        #pragma omp for schedule(dynamic)
-        for (FeatureIndex f = 0; f < n_features; ++f) {
-            if (!features.empty() && 
-                std::find(features.begin(), features.end(), f) == features.end()) {
-                continue;
-            }
-            
-            #ifdef TURBOCAT_AVX512
-            if (use_simd_) {
-                build_feature_avx512(
-                    dataset.binned().column(f),
-                    dataset.gradients(),
-                    dataset.hessians(),
-                    sample_indices,
-                    local_hist.bins(f)
-                );
-            } else
-            #endif
+    // For small sample sets or single thread, use optimized sequential version
+    if (sample_indices.size() < MIN_SAMPLES_FOR_PARALLEL || n_threads_ == 1) {
+        for (FeatureIndex f : features_to_process) {
             #ifdef TURBOCAT_AVX2
             if (use_simd_) {
                 build_feature_avx2(
                     dataset.binned().column(f),
-                    dataset.gradients(),
-                    dataset.hessians(),
+                    gradients,
+                    hessians,
                     sample_indices,
-                    local_hist.bins(f)
+                    output.bins(f)
                 );
             } else
             #endif
             {
                 build_feature_scalar(
                     dataset.binned().column(f),
-                    dataset.gradients(),
-                    dataset.hessians(),
+                    gradients,
+                    hessians,
                     sample_indices,
-                    local_hist.bins(f)
+                    output.bins(f)
                 );
             }
         }
+        return;
     }
     
-    // Merge thread-local histograms
-    merge_histograms(output, n_features);
+    // Feature-parallel histogram building (more efficient than data-parallel)
+    #pragma omp parallel for schedule(static) num_threads(n_threads_)
+    for (size_t fi = 0; fi < features_to_process.size(); ++fi) {
+        FeatureIndex f = features_to_process[fi];
+        
+        #ifdef TURBOCAT_AVX512
+        if (use_simd_) {
+            build_feature_avx512(
+                dataset.binned().column(f),
+                gradients,
+                hessians,
+                sample_indices,
+                output.bins(f)
+            );
+        } else
+        #endif
+        #ifdef TURBOCAT_AVX2
+        if (use_simd_) {
+            build_feature_avx2(
+                dataset.binned().column(f),
+                gradients,
+                hessians,
+                sample_indices,
+                output.bins(f)
+            );
+        } else
+        #endif
+        {
+            build_feature_scalar(
+                dataset.binned().column(f),
+                gradients,
+                hessians,
+                sample_indices,
+                output.bins(f)
+            );
+        }
+    }
 }
 
 void CPUHistogramBuilder::build_quantized(
@@ -157,8 +154,6 @@ void CPUHistogramBuilder::build_quantized(
     const std::vector<FeatureIndex>& feature_indices,
     Histogram& output
 ) {
-    // Similar to build() but uses quantized gradients
-    // Dequantize on-the-fly during accumulation
     output.clear();
     
     const QuantizedGrad* q_grads = dataset.quantized_gradients();
@@ -186,44 +181,28 @@ void CPUHistogramBuilder::build_feature_scalar(
     const std::vector<Index>& indices,
     GradientPair* output
 ) {
-    for (Index idx : indices) {
-        BinIndex bin = bins[idx];
-        output[bin].grad += gradients[idx];
-        output[bin].hess += hessians[idx];
-        output[bin].count += 1;
-    }
-}
-
-#ifdef TURBOCAT_AVX2
-void CPUHistogramBuilder::build_feature_avx2(
-    const BinIndex* bins,
-    const Float* gradients,
-    const Float* hessians,
-    const std::vector<Index>& indices,
-    GradientPair* output
-) {
-    // AVX2 doesn't have scatter, so we use a hybrid approach:
-    // 1. Batch-gather values
-    // 2. Accumulate in temporary buffers
-    // 3. Write back
-    
-    // For histogram building, the random access pattern makes SIMD less beneficial
-    // Fall back to scalar with manual unrolling for better cache behavior
-    
-    size_t n = indices.size();
+    const size_t n = indices.size();
     size_t i = 0;
     
-    // Unroll 4x for better pipelining
-    for (; i + 4 <= n; i += 4) {
-        Index idx0 = indices[i];
-        Index idx1 = indices[i + 1];
-        Index idx2 = indices[i + 2];
-        Index idx3 = indices[i + 3];
+    // 8x unrolled loop for better instruction-level parallelism
+    for (; i + 8 <= n; i += 8) {
+        const Index idx0 = indices[i];
+        const Index idx1 = indices[i + 1];
+        const Index idx2 = indices[i + 2];
+        const Index idx3 = indices[i + 3];
+        const Index idx4 = indices[i + 4];
+        const Index idx5 = indices[i + 5];
+        const Index idx6 = indices[i + 6];
+        const Index idx7 = indices[i + 7];
         
-        BinIndex bin0 = bins[idx0];
-        BinIndex bin1 = bins[idx1];
-        BinIndex bin2 = bins[idx2];
-        BinIndex bin3 = bins[idx3];
+        const BinIndex bin0 = bins[idx0];
+        const BinIndex bin1 = bins[idx1];
+        const BinIndex bin2 = bins[idx2];
+        const BinIndex bin3 = bins[idx3];
+        const BinIndex bin4 = bins[idx4];
+        const BinIndex bin5 = bins[idx5];
+        const BinIndex bin6 = bins[idx6];
+        const BinIndex bin7 = bins[idx7];
         
         output[bin0].grad += gradients[idx0];
         output[bin0].hess += hessians[idx0];
@@ -240,6 +219,103 @@ void CPUHistogramBuilder::build_feature_avx2(
         output[bin3].grad += gradients[idx3];
         output[bin3].hess += hessians[idx3];
         output[bin3].count += 1;
+        
+        output[bin4].grad += gradients[idx4];
+        output[bin4].hess += hessians[idx4];
+        output[bin4].count += 1;
+        
+        output[bin5].grad += gradients[idx5];
+        output[bin5].hess += hessians[idx5];
+        output[bin5].count += 1;
+        
+        output[bin6].grad += gradients[idx6];
+        output[bin6].hess += hessians[idx6];
+        output[bin6].count += 1;
+        
+        output[bin7].grad += gradients[idx7];
+        output[bin7].hess += hessians[idx7];
+        output[bin7].count += 1;
+    }
+    
+    // Handle remainder
+    for (; i < n; ++i) {
+        Index idx = indices[i];
+        BinIndex bin = bins[idx];
+        output[bin].grad += gradients[idx];
+        output[bin].hess += hessians[idx];
+        output[bin].count += 1;
+    }
+}
+
+#ifdef TURBOCAT_AVX2
+void CPUHistogramBuilder::build_feature_avx2(
+    const BinIndex* bins,
+    const Float* gradients,
+    const Float* hessians,
+    const std::vector<Index>& indices,
+    GradientPair* output
+) {
+    // AVX2 doesn't have scatter, so we use manual unrolling with prefetching
+    const size_t n = indices.size();
+    size_t i = 0;
+    
+    // 8x unrolled with prefetching
+    for (; i + 8 <= n; i += 8) {
+        // Prefetch next batch
+        if (i + 16 < n) {
+            _mm_prefetch(reinterpret_cast<const char*>(&bins[indices[i + 16]]), _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(&gradients[indices[i + 16]]), _MM_HINT_T0);
+        }
+        
+        const Index idx0 = indices[i];
+        const Index idx1 = indices[i + 1];
+        const Index idx2 = indices[i + 2];
+        const Index idx3 = indices[i + 3];
+        const Index idx4 = indices[i + 4];
+        const Index idx5 = indices[i + 5];
+        const Index idx6 = indices[i + 6];
+        const Index idx7 = indices[i + 7];
+        
+        const BinIndex bin0 = bins[idx0];
+        const BinIndex bin1 = bins[idx1];
+        const BinIndex bin2 = bins[idx2];
+        const BinIndex bin3 = bins[idx3];
+        const BinIndex bin4 = bins[idx4];
+        const BinIndex bin5 = bins[idx5];
+        const BinIndex bin6 = bins[idx6];
+        const BinIndex bin7 = bins[idx7];
+        
+        output[bin0].grad += gradients[idx0];
+        output[bin0].hess += hessians[idx0];
+        output[bin0].count += 1;
+        
+        output[bin1].grad += gradients[idx1];
+        output[bin1].hess += hessians[idx1];
+        output[bin1].count += 1;
+        
+        output[bin2].grad += gradients[idx2];
+        output[bin2].hess += hessians[idx2];
+        output[bin2].count += 1;
+        
+        output[bin3].grad += gradients[idx3];
+        output[bin3].hess += hessians[idx3];
+        output[bin3].count += 1;
+        
+        output[bin4].grad += gradients[idx4];
+        output[bin4].hess += hessians[idx4];
+        output[bin4].count += 1;
+        
+        output[bin5].grad += gradients[idx5];
+        output[bin5].hess += hessians[idx5];
+        output[bin5].count += 1;
+        
+        output[bin6].grad += gradients[idx6];
+        output[bin6].hess += hessians[idx6];
+        output[bin6].count += 1;
+        
+        output[bin7].grad += gradients[idx7];
+        output[bin7].hess += hessians[idx7];
+        output[bin7].count += 1;
     }
     
     // Handle remainder
@@ -261,24 +337,20 @@ void CPUHistogramBuilder::build_feature_avx512(
     const std::vector<Index>& indices,
     GradientPair* output
 ) {
-    // AVX-512 has scatter instructions, but histogram building is still
-    // conflict-prone. Use conflict detection for safe parallel accumulation.
-    
-    size_t n = indices.size();
-    
-    // For small histograms (255 bins), use scalar with 8x unrolling
-    // The random access pattern doesn't benefit much from SIMD gather/scatter
-    
+    // AVX-512 with conflict detection for safe parallel accumulation
+    const size_t n = indices.size();
     size_t i = 0;
-    for (; i + 8 <= n; i += 8) {
+    
+    // 16x unrolled with prefetching
+    for (; i + 16 <= n; i += 16) {
         // Prefetch next batch
-        if (i + 16 < n) {
-            _mm_prefetch(reinterpret_cast<const char*>(&bins[indices[i + 8]]), _MM_HINT_T0);
-            _mm_prefetch(reinterpret_cast<const char*>(&gradients[indices[i + 8]]), _MM_HINT_T0);
+        if (i + 32 < n) {
+            _mm_prefetch(reinterpret_cast<const char*>(&bins[indices[i + 32]]), _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(&gradients[indices[i + 32]]), _MM_HINT_T0);
         }
         
-        #pragma unroll(8)
-        for (int j = 0; j < 8; ++j) {
+        #pragma unroll(16)
+        for (int j = 0; j < 16; ++j) {
             Index idx = indices[i + j];
             BinIndex bin = bins[idx];
             output[bin].grad += gradients[idx];
@@ -333,14 +405,18 @@ SplitInfo SplitFinder::find_best_split(
 ) {
     SplitInfo best_split;
     
+    // Precompute parent gain term
+    const Float lambda = config_.lambda_l2;
+    const Float parent_gain = (parent_sum.grad * parent_sum.grad) / (parent_sum.hess + lambda);
+    
     #pragma omp parallel
     {
         SplitInfo local_best;
         
-        #pragma omp for nowait schedule(dynamic)
+        #pragma omp for nowait schedule(static)
         for (size_t i = 0; i < feature_indices.size(); ++i) {
             FeatureIndex f = feature_indices[i];
-            BinIndex n_bins = histogram.max_bins();  // TODO: get actual bins
+            BinIndex n_bins = histogram.max_bins();
             
             SplitInfo split = find_best_split_feature(
                 histogram.bins(f), n_bins, parent_sum, f
@@ -373,6 +449,10 @@ SplitInfo SplitFinder::find_best_split_feature(
     
     GradientPair left_sum;
     
+    // Precompute parent gain term once
+    const Float lambda = config_.lambda_l2;
+    const Float parent_gain = (parent_sum.grad * parent_sum.grad) / (parent_sum.hess + lambda);
+    
     // Scan through bins to find best split
     for (BinIndex b = 0; b < n_bins - 1; ++b) {
         left_sum += bins[b];
@@ -383,12 +463,15 @@ SplitInfo SplitFinder::find_best_split_feature(
             continue;
         }
         
-        // Compute gain
+        // Compute gain - optimized version using precomputed parent_gain
         Float gain;
         switch (config_.criterion) {
-            case SplitCriterion::Variance:
-                gain = compute_gain_variance(left_sum, right_sum, parent_sum);
+            case SplitCriterion::Variance: {
+                Float gain_left = (left_sum.grad * left_sum.grad) / (left_sum.hess + lambda);
+                Float gain_right = (right_sum.grad * right_sum.grad) / (right_sum.hess + lambda);
+                gain = 0.5f * (gain_left + gain_right - parent_gain);
                 break;
+            }
             case SplitCriterion::Gini:
                 gain = compute_gain_gini(left_sum, right_sum, parent_sum);
                 break;
@@ -396,7 +479,9 @@ SplitInfo SplitFinder::find_best_split_feature(
                 gain = compute_gain_tsallis(left_sum, right_sum, parent_sum, config_.tsallis_q);
                 break;
             default:
-                gain = compute_gain_variance(left_sum, right_sum, parent_sum);
+                Float gain_left = (left_sum.grad * left_sum.grad) / (left_sum.hess + lambda);
+                Float gain_right = (right_sum.grad * right_sum.grad) / (right_sum.hess + lambda);
+                gain = 0.5f * (gain_left + gain_right - parent_gain);
         }
         
         if (gain > best.gain && gain >= config_.min_split_gain) {
@@ -418,9 +503,6 @@ Float SplitFinder::compute_gain_variance(
     const GradientPair& right,
     const GradientPair& parent
 ) const {
-    // Standard variance reduction gain with L2 regularization:
-    // Gain = 0.5 * [G_L^2 / (H_L + λ) + G_R^2 / (H_R + λ) - G_P^2 / (H_P + λ)]
-    
     Float lambda = config_.lambda_l2;
     
     Float gain_left = (left.grad * left.grad) / (left.hess + lambda);
@@ -435,12 +517,9 @@ Float SplitFinder::compute_gain_gini(
     const GradientPair& right,
     const GradientPair& parent
 ) const {
-    // Gini impurity: 1 - Σ p_i^2
-    // For binary: 2 * p * (1 - p)
-    
     auto gini = [](const GradientPair& g) -> Float {
         if (g.count == 0) return 0.0f;
-        Float p = (g.grad / g.count + 1.0f) / 2.0f;  // Convert gradient to prob
+        Float p = (g.grad / g.count + 1.0f) / 2.0f;
         p = std::max(0.0f, std::min(1.0f, p));
         return 2.0f * p * (1.0f - p);
     };
@@ -463,16 +542,12 @@ Float SplitFinder::compute_gain_tsallis(
     const GradientPair& parent,
     Float q
 ) const {
-    // Tsallis entropy: S_q(p) = (1 - Σ p_i^q) / (q - 1)
-    // Special cases: q=1 -> Shannon, q=2 -> Gini
-    
     auto tsallis = [q](const GradientPair& g) -> Float {
         if (g.count == 0) return 0.0f;
         Float p = (g.grad / g.count + 1.0f) / 2.0f;
         p = std::max(1e-7f, std::min(1.0f - 1e-7f, p));
         
         if (std::abs(q - 1.0f) < 1e-6f) {
-            // Shannon entropy limit
             return -p * std::log(p) - (1 - p) * std::log(1 - p);
         }
         
@@ -492,7 +567,6 @@ Float SplitFinder::compute_gain_tsallis(
 }
 
 Float SplitFinder::compute_leaf_value(const GradientPair& stats) const {
-    // Optimal leaf value: -G / (H + λ)
     return -stats.grad / (stats.hess + config_.lambda_l2);
 }
 
@@ -543,10 +617,10 @@ void subtract_histograms(
     
     size_t i = 0;
     for (; i + 2 <= count; i += 2) {
-        __m256 p = _mm256_load_ps(reinterpret_cast<const float*>(&parent[i]));
-        __m256 c = _mm256_load_ps(reinterpret_cast<const float*>(&child[i]));
+        __m256 p = _mm256_loadu_ps(reinterpret_cast<const float*>(&parent[i]));
+        __m256 c = _mm256_loadu_ps(reinterpret_cast<const float*>(&child[i]));
         __m256 r = _mm256_sub_ps(p, c);
-        _mm256_store_ps(reinterpret_cast<float*>(&result[i]), r);
+        _mm256_storeu_ps(reinterpret_cast<float*>(&result[i]), r);
     }
     
     // Handle remainder
@@ -568,6 +642,7 @@ void compute_gains_batch(
     Float lambda_l2
 ) {
     GradientPair left_sum;
+    const Float parent_gain = (parent_sum.grad * parent_sum.grad) / (parent_sum.hess + lambda_l2);
     
     for (size_t b = 0; b < n_bins; ++b) {
         left_sum += bins[b];
@@ -575,9 +650,8 @@ void compute_gains_batch(
         
         Float gain_left = (left_sum.grad * left_sum.grad) / (left_sum.hess + lambda_l2);
         Float gain_right = (right_sum.grad * right_sum.grad) / (right_sum.hess + lambda_l2);
-        Float gain_parent = (parent_sum.grad * parent_sum.grad) / (parent_sum.hess + lambda_l2);
         
-        gains[b] = 0.5f * (gain_left + gain_right - gain_parent);
+        gains[b] = 0.5f * (gain_left + gain_right - parent_gain);
     }
 }
 
