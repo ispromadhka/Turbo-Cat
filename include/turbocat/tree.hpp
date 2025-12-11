@@ -1,0 +1,329 @@
+#pragma once
+
+/**
+ * TurboCat Tree Structures
+ * 
+ * Includes:
+ * - Standard decision tree (histogram-based)
+ * - GradTree: Differentiable axis-aligned trees (AAAI 2024)
+ * 
+ * GradTree innovation: Instead of greedy splitting, jointly optimize all
+ * tree parameters via gradient descent. Uses dense representation with
+ * differentiable feature selection and threshold optimization.
+ */
+
+#include "types.hpp"
+#include "config.hpp"
+#include "dataset.hpp"
+#include "histogram.hpp"
+#include <Eigen/Dense>
+#include <memory>
+#include <functional>
+
+namespace turbocat {
+
+// ============================================================================
+// Standard Decision Tree
+// ============================================================================
+
+class Tree {
+public:
+    Tree() = default;
+    explicit Tree(const TreeConfig& config);
+    
+    // Build tree from histogram
+    void build(
+        const Dataset& dataset,
+        const std::vector<Index>& sample_indices,
+        HistogramBuilder& hist_builder
+    );
+    
+    // Predict single sample
+    Float predict(const Float* features, FeatureIndex n_features) const;
+    Float predict(const Dataset& dataset, Index row) const;
+    
+    // Batch prediction
+    void predict_batch(
+        const Float* features,
+        Index n_samples,
+        FeatureIndex n_features,
+        Float* output
+    ) const;
+    
+    // Update leaf values (for refinement)
+    void update_leaf_values(const Dataset& dataset, const std::vector<Index>& indices);
+    
+    // Access tree structure
+    const std::vector<TreeNode>& nodes() const { return nodes_; }
+    TreeIndex n_nodes() const { return static_cast<TreeIndex>(nodes_.size()); }
+    TreeIndex n_leaves() const { return n_leaves_; }
+    uint16_t depth() const { return depth_; }
+    
+    // Feature importance
+    std::vector<Float> feature_importance() const;
+    
+    // Serialization
+    void save(std::ostream& out) const;
+    static Tree load(std::istream& in);
+    
+private:
+    TreeConfig config_;
+    std::vector<TreeNode> nodes_;
+    TreeIndex n_leaves_ = 0;
+    uint16_t depth_ = 0;
+    
+    // Build helpers
+    void build_recursive(
+        TreeIndex node_idx,
+        const Dataset& dataset,
+        const std::vector<Index>& indices,
+        const std::vector<FeatureIndex>& features,
+        HistogramBuilder& hist_builder,
+        Histogram& histogram,
+        uint16_t current_depth
+    );
+    
+    TreeIndex add_node();
+    void make_leaf(TreeIndex node_idx, const GradientPair& stats);
+    
+    // Inference helpers
+    TreeIndex traverse(const Float* features, const std::vector<Float>& bin_edges,
+                       FeatureIndex feature) const;
+};
+
+// ============================================================================
+// GradTree: Gradient-Optimized Decision Tree (AAAI 2024)
+// ============================================================================
+
+/**
+ * GradTree represents a decision tree using a differentiable dense formulation:
+ * 
+ * For a tree of depth D with 2^D leaves:
+ * - Feature selection: Soft one-hot W ∈ R^{(2^D-1) × F} for internal nodes
+ * - Thresholds: t ∈ R^{(2^D-1)} for split points
+ * - Leaf values: v ∈ R^{2^D}
+ * 
+ * The routing probability from root to leaf l is:
+ *   P(leaf=l | x) = Π_{nodes on path} σ(±(Wx - t))
+ * 
+ * where σ is sigmoid (or entmax for sparsity) and ± depends on direction.
+ * 
+ * Prediction: ŷ = Σ_l P(leaf=l | x) · v_l
+ * 
+ * This allows gradient descent optimization of the entire tree structure,
+ * overcoming the local optimality of greedy splitting.
+ */
+
+class GradTree {
+public:
+    using Matrix = Eigen::Matrix<Float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+    using Vector = Eigen::Matrix<Float, Eigen::Dynamic, 1>;
+    
+    GradTree() = default;
+    explicit GradTree(const TreeConfig& config, FeatureIndex n_features);
+    
+    // ========================================================================
+    // Initialization
+    // ========================================================================
+    
+    /**
+     * Initialize from a standard tree (warm start)
+     * This converts greedy splits to differentiable parameters
+     */
+    void initialize_from_tree(const Tree& tree, const Dataset& dataset);
+    
+    /**
+     * Random initialization
+     */
+    void initialize_random(uint64_t seed);
+    
+    // ========================================================================
+    // Training
+    // ========================================================================
+    
+    /**
+     * Optimize tree parameters via gradient descent
+     * @param dataset Training data
+     * @param indices Sample indices to use
+     * @param loss_fn Loss function (gradient/hessian computation)
+     */
+    void optimize(
+        const Dataset& dataset,
+        const std::vector<Index>& indices,
+        std::function<void(const Vector&, const Vector&, Vector&, Vector&)> loss_fn
+    );
+    
+    /**
+     * Single optimization step
+     * Returns loss value
+     */
+    Float optimization_step(
+        const Dataset& dataset,
+        const std::vector<Index>& indices,
+        const Vector& targets
+    );
+    
+    // ========================================================================
+    // Prediction
+    // ========================================================================
+    
+    /**
+     * Soft prediction (differentiable)
+     * Returns weighted sum over leaf values
+     */
+    Float predict_soft(const Float* features) const;
+    
+    /**
+     * Hard prediction (for inference)
+     * Uses argmax routing
+     */
+    Float predict_hard(const Float* features) const;
+    
+    /**
+     * Batch soft prediction
+     */
+    void predict_soft_batch(
+        const Float* features,
+        Index n_samples,
+        Float* output
+    ) const;
+    
+    /**
+     * Compute leaf routing probabilities
+     * Returns 2^D probabilities for each leaf
+     */
+    Vector compute_leaf_probs(const Float* features) const;
+    
+    // ========================================================================
+    // Conversion
+    // ========================================================================
+    
+    /**
+     * Convert to standard tree (discretize parameters)
+     * Uses argmax for feature selection and median for thresholds
+     */
+    Tree to_standard_tree() const;
+    
+    // ========================================================================
+    // Access Parameters
+    // ========================================================================
+    
+    const Matrix& feature_weights() const { return W_; }
+    const Vector& thresholds() const { return t_; }
+    const Vector& leaf_values() const { return v_; }
+    
+    Matrix& feature_weights() { return W_; }
+    Vector& thresholds() { return t_; }
+    Vector& leaf_values() { return v_; }
+    
+    uint16_t depth() const { return depth_; }
+    TreeIndex n_internal_nodes() const { return (1 << depth_) - 1; }
+    TreeIndex n_leaves() const { return 1 << depth_; }
+    
+private:
+    TreeConfig config_;
+    FeatureIndex n_features_ = 0;
+    uint16_t depth_ = 0;
+    
+    // Learnable parameters
+    Matrix W_;      // Feature selection weights: (2^D - 1) × F
+    Vector t_;      // Split thresholds: 2^D - 1
+    Vector v_;      // Leaf values: 2^D
+    
+    // Optimizer state (Adam)
+    Matrix W_m_, W_v_;  // First/second moment for W
+    Vector t_m_, t_v_;  // For thresholds
+    Vector v_m_, v_v_;  // For leaf values
+    uint32_t opt_step_ = 0;
+    
+    // Temperature for sigmoid (annealing)
+    Float temperature_ = 1.0f;
+    
+    // ========================================================================
+    // Internal Methods
+    // ========================================================================
+    
+    /**
+     * Forward pass: compute predictions and cache intermediate values
+     */
+    struct ForwardCache {
+        Matrix routing_probs;      // N × (2^D - 1) internal node probs
+        Matrix leaf_probs;         // N × 2^D leaf probabilities
+        Vector predictions;        // N predictions
+    };
+    
+    ForwardCache forward(const Matrix& X) const;
+    
+    /**
+     * Backward pass: compute gradients
+     */
+    struct Gradients {
+        Matrix dW;
+        Vector dt;
+        Vector dv;
+    };
+    
+    Gradients backward(
+        const Matrix& X,
+        const ForwardCache& cache,
+        const Vector& grad_output  // dL/d(predictions)
+    ) const;
+    
+    /**
+     * Apply Adam update
+     */
+    void adam_update(const Gradients& grads);
+    
+    /**
+     * Entmax activation (sparse alternative to softmax)
+     * Parameter alpha: 1.5 for entmax-1.5, 2.0 for sparsemax
+     */
+    static Vector entmax(const Vector& input, Float alpha = 1.5f);
+    static Matrix entmax_rows(const Matrix& input, Float alpha = 1.5f);
+    
+    /**
+     * Sigmoid with temperature
+     */
+    Float sigmoid(Float x) const {
+        return 1.0f / (1.0f + std::exp(-x / temperature_));
+    }
+    
+    /**
+     * Get path to leaf (for standard tree conversion)
+     */
+    std::vector<std::pair<TreeIndex, bool>> get_path_to_leaf(TreeIndex leaf_idx) const;
+};
+
+// ============================================================================
+// Tree Ensemble
+// ============================================================================
+
+class TreeEnsemble {
+public:
+    TreeEnsemble() = default;
+    
+    void add_tree(std::unique_ptr<Tree> tree, Float weight = 1.0f);
+    // void add_gradtree(std::unique_ptr<GradTree> tree, Float weight = 1.0f);
+    
+    Float predict(const Float* features, FeatureIndex n_features) const;
+    Float predict(const Dataset& data, Index row) const;  // Using binned data
+    void predict_batch(const Float* features, Index n_samples, 
+                       FeatureIndex n_features, Float* output) const;
+    void predict_batch(const Dataset& data, Float* output) const;  // Using binned data
+    
+    size_t n_trees() const { return trees_.size() + gradtrees_.size(); }
+    
+    // Ensemble sparsification (LP-based thinning)
+    void sparsify(Float target_sparsity);
+    
+    // Feature importance (aggregated)
+    std::vector<Float> feature_importance() const;
+    
+private:
+    std::vector<std::unique_ptr<Tree>> trees_;
+    std::vector<std::unique_ptr<GradTree>> gradtrees_;
+    std::vector<Float> tree_weights_;
+    std::vector<Float> gradtree_weights_;
+};
+
+} // namespace turbocat

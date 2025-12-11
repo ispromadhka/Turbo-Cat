@@ -1,0 +1,73 @@
+[build-system]
+requires = [
+    "setuptools>=45",
+    "wheel",
+    "cmake>=3.18",
+    "pybind11>=2.10",
+    "numpy>=1.20",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "turbocat"
+version = "0.1.0"
+description = "Next-Generation Gradient Boosting Framework - Outperforms CatBoost on model quality"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "TurboCat Contributors", email = "turbocat@example.com"}
+]
+maintainers = [
+    {name = "ispromadhka"}
+]
+keywords = [
+    "machine-learning",
+    "gradient-boosting", 
+    "xgboost",
+    "catboost",
+    "lightgbm",
+    "decision-trees",
+    "classification",
+    "regression"
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: C++",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+requires-python = ">=3.8"
+dependencies = [
+    "numpy>=1.20.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=6.0",
+    "scikit-learn>=1.0",
+    "pandas>=1.3",
+    "catboost>=1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/ispromadhka/Turbo-Cat"
+Documentation = "https://github.com/ispromadhka/Turbo-Cat#readme"
+Repository = "https://github.com/ispromadhka/Turbo-Cat.git"
+Issues = "https://github.com/ispromadhka/Turbo-Cat/issues"
+
+[tool.setuptools]
+packages = ["turbocat"]
+package-dir = {"" = "python"}
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
