@@ -228,3 +228,5 @@ message(STATUS "  Python:       ${TURBOCAT_BUILD_PYTHON}")
 message(STATUS "  Tests:        ${TURBOCAT_BUILD_TESTS}")
 message(STATUS "  Benchmarks:   ${TURBOCAT_BUILD_BENCHMARKS}")
 message(STATUS "")
+
+install(TARGETS _turbocat LIBRARY DESTINATION .)
