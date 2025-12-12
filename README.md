@@ -113,9 +113,7 @@ With many irrelevant features (200f, 20 informative), CatBoost is slightly bette
 ```bash
 git clone https://github.com/ispromadhka/Turbo-Cat.git
 cd Turbo-Cat
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j8
+pip install .
 ```
 
 ### Requirements
@@ -128,20 +126,17 @@ make -j8
 ### Optional dependencies
 
 - OpenMP (for parallel training)
-- Eigen3 (auto-downloaded if not found)
 
 ---
 
 ## 🔥 Quick Start
 
 ```python
-import sys
-sys.path.insert(0, 'build')
-import _turbocat as tc
+from turbocat import TurboCatClassifier
 import numpy as np
 
 # Create classifier
-model = tc.TurboCatClassifier(
+model = TurboCatClassifier(
     n_estimators=50,
     max_depth=8,
     learning_rate=0.1,
@@ -186,6 +181,7 @@ HIGH-DIM:      TC wins Accuracy 2/4        | Speedup 7.1x train, 17.1x inference
 SPECIAL:       TC wins Accuracy 3/4        | Speedup 2.0x train, 15.1x inference
 ```
 
+---
 
 <a name="russian"></a>
 # 🇷🇺 Русский
@@ -296,9 +292,7 @@ CatBoost лучше обобщает на малых выборках (1/4 по�
 ```bash
 git clone https://github.com/ispromadhka/Turbo-Cat.git
 cd Turbo-Cat
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j8
+pip install .
 ```
 
 ### Требования
@@ -311,20 +305,17 @@ make -j8
 ### Опциональные зависимости
 
 - OpenMP (для параллельного обучения)
-- Eigen3 (авто-скачивается если не найден)
 
 ---
 
 ## 🔥 Быстрый старт
 
 ```python
-import sys
-sys.path.insert(0, 'build')
-import _turbocat as tc
+from turbocat import TurboCatClassifier
 import numpy as np
 
 # Создание классификатора
-model = tc.TurboCatClassifier(
+model = TurboCatClassifier(
     n_estimators=50,
     max_depth=8,
     learning_rate=0.1,
@@ -368,6 +359,15 @@ SCALE:         TC побеждает Accuracy 2/3        | Ускорение 5.
 HIGH-DIM:      TC побеждает Accuracy 2/4        | Ускорение 7.1x train, 17.1x inference
 SPECIAL:       TC побеждает Accuracy 3/4        | Ускорение 2.0x train, 15.1x inference
 ```
+
+---
+
+## 📚 Research References
+
+- **GradTree**: Marton et al., "Gradient-based Optimization of Gradient Boosting Soft Trees", AAAI 2024
+- **Focal Loss**: Lin et al., "Focal Loss for Dense Object Detection", ICCV 2017
+- **LDAM**: Cao et al., "Learning Imbalanced Datasets with Label-Distribution-Aware Margin Loss", NeurIPS 2019
+- **Tsallis Entropy**: Maszczyk & Duch, "Comparison of Shannon, Renyi and Tsallis Entropy", 2008
 
 ---
 
