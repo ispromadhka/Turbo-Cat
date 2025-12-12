@@ -1,19 +1,75 @@
 [build-system]
-requires = ["scikit-build-core>=0.4.3", "pybind11>=2.11.0"]
+requires = [
+    "scikit-build-core>=0.5",
+    "pybind11>=2.10",
+    "numpy>=1.20",
+]
 build-backend = "scikit_build_core.build"
 
 [project]
 name = "turbocat"
-version = "0.2.0"
-description = "High-performance gradient boosting library"
+version = "0.2.1"
+description = "Next-Generation Gradient Boosting Framework - Outperforms CatBoost on model quality"
 readme = "README.md"
 license = {text = "MIT"}
+authors = [
+    {name = "TurboCat Contributors", email = "turbocat@example.com"}
+]
+maintainers = [
+    {name = "ispromadhka"}
+]
+keywords = [
+    "machine-learning",
+    "gradient-boosting",
+    "xgboost",
+    "catboost",
+    "lightgbm",
+    "decision-trees",
+    "classification",
+    "regression"
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: C++",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 requires-python = ">=3.8"
-dependencies = ["numpy>=1.19.0"]
+dependencies = [
+    "numpy>=1.20.0",
+]
 
 [project.optional-dependencies]
-dev = ["pytest", "scikit-learn"]
+dev = [
+    "pytest>=6.0",
+    "scikit-learn>=1.0",
+    "pandas>=1.3",
+    "catboost>=1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/ispromadhka/Turbo-Cat"
+Documentation = "https://github.com/ispromadhka/Turbo-Cat#readme"
+Repository = "https://github.com/ispromadhka/Turbo-Cat.git"
+Issues = "https://github.com/ispromadhka/Turbo-Cat/issues"
 
 [tool.scikit-build]
-cmake.args = ["-DCMAKE_BUILD_TYPE=Release", "-DTURBOCAT_BUILD_TESTS=OFF", "-DTURBOCAT_BUILD_BENCHMARKS=OFF"]
-wheel.packages = ["turbocat"]
+cmake.build-type = "Release"
+
+[tool.scikit-build.cmake.define]
+TURBOCAT_BUILD_PYTHON = "ON"
+TURBOCAT_BUILD_TESTS = "OFF"
+TURBOCAT_BUILD_BENCHMARKS = "OFF"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]

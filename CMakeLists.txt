@@ -51,7 +51,7 @@ if(COMPILER_SUPPORTS_FMA)
 endif()
 
 # Optimization flags
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG ${TURBOCAT_SIMD_FLAGS} -ffast-math -funroll-loops")
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG ${TURBOCAT_SIMD_FLAGS} -funroll-loops")
 set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -DDEBUG")
 
 # Warnings
@@ -146,9 +146,12 @@ if(TURBOCAT_BUILD_PYTHON)
     
     pybind11_add_module(_turbocat python/bindings.cpp)
     target_link_libraries(_turbocat PRIVATE turbocat_core)
-    
-    # Install Python module
-    install(TARGETS _turbocat LIBRARY DESTINATION python/turbocat)
+
+    # Install Python module (C++ extension)
+    install(TARGETS _turbocat LIBRARY DESTINATION turbocat)
+
+    # Install Python files
+    install(FILES python/turbocat/__init__.py DESTINATION turbocat)
 endif()
 
 # ============================================================================
@@ -228,5 +231,3 @@ message(STATUS "  Python:       ${TURBOCAT_BUILD_PYTHON}")
 message(STATUS "  Tests:        ${TURBOCAT_BUILD_TESTS}")
 message(STATUS "  Benchmarks:   ${TURBOCAT_BUILD_BENCHMARKS}")
 message(STATUS "")
-
-install(TARGETS _turbocat LIBRARY DESTINATION .)

@@ -86,7 +86,7 @@ void Booster::train(
     // Main training loop
     for (uint32_t iter = 0; iter < config_.boosting.n_estimators; ++iter) {
         auto iter_start = std::chrono::high_resolution_clock::now();
-        
+
         // Update gradients
         update_gradients(train_data, train_preds);
         
