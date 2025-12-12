@@ -1,5 +1,6 @@
 # Build
 build/
+build_*/
 dist/
 *.egg-info/
 __pycache__/
@@ -8,6 +9,12 @@ __pycache__/
 *.dylib
 *.a
 *.o
+
+# Don't track local turbocat/ folder - use pip install instead
+/turbocat/
+
+# CatBoost artifacts
+catboost_info/
 
 # IDE
 .idea/

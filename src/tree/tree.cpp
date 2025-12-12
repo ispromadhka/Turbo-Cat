@@ -78,7 +78,7 @@ void Tree::build_recursive(
     uint16_t current_depth
 ) {
     depth_ = std::max(depth_, current_depth);
-    
+
     TreeNode& node = nodes_[node_idx];
     
     // Check stopping conditions
@@ -136,22 +136,28 @@ void Tree::build_recursive(
     }
     
     // Learn missing value direction
-    if (config_.learn_missing_direction && 
+    if (config_.learn_missing_direction &&
         (left_indices.size() != indices.size() && right_indices.size() != indices.size())) {
         node.default_left = left_indices.size() >= right_indices.size() ? 1 : 0;
     }
-    
+
     // Create child nodes
-    node.left_child = add_node();
-    node.right_child = add_node();
-    
-    nodes_[node.left_child].stats = best_split.left_stats;
-    nodes_[node.right_child].stats = best_split.right_stats;
-    
+    // IMPORTANT: add_node() can reallocate the nodes_ vector, invalidating 'node' reference
+    // We must add both children first, then re-acquire the reference
+    TreeIndex left_child = add_node();
+    TreeIndex right_child = add_node();
+
+    // Re-acquire reference after potential reallocation
+    nodes_[node_idx].left_child = left_child;
+    nodes_[node_idx].right_child = right_child;
+
+    nodes_[left_child].stats = best_split.left_stats;
+    nodes_[right_child].stats = best_split.right_stats;
+
     // Recursively build children
-    build_recursive(node.left_child, dataset, left_indices, features,
+    build_recursive(left_child, dataset, left_indices, features,
                    hist_builder, histogram, current_depth + 1);
-    build_recursive(node.right_child, dataset, right_indices, features,
+    build_recursive(right_child, dataset, right_indices, features,
                    hist_builder, histogram, current_depth + 1);
 }
 

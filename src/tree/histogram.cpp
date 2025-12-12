@@ -1,6 +1,6 @@
 /**
  * TurboCat Histogram Builder Implementation
- * 
+ *
  * SIMD-optimized histogram construction.
  * Key optimization: vectorized gradient accumulation into bins.
  */
