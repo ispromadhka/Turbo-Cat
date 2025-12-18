@@ -411,13 +411,14 @@ public:
                 const auto& nodes = tree.nodes();
                 if (nodes.empty()) continue;
 
+                float weight = ensemble.tree_weight(t);
                 TreeIndex node_idx = 0;
                 while (!nodes[node_idx].is_leaf) {
                     const TreeNode& node = nodes[node_idx];
                     BinIndex bin = test_data.binned().get(row, node.split_feature);
                     node_idx = (bin > node.split_bin) ? node.right_child : node.left_child;
                 }
-                sum += nodes[node_idx].value;
+                sum += weight * nodes[node_idx].value;
             }
             predictions[row] = sum + booster_->base_prediction();
         }

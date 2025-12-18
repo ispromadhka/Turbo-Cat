@@ -19,7 +19,7 @@ Example:
     >>> predictions = clf.predict_proba(X_test)
 """
 
-__version__ = "0.2.4.dev9"
+__version__ = "0.2.4.dev10"
 
 import numpy as np
 
