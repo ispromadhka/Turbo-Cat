@@ -383,7 +383,7 @@ public:
         is_fitted_ = true;
     }
     
-    py::array_t<float> predict(py::array_t<float> X) {
+    std::vector<float> predict(py::array_t<float> X) {
         if (!is_fitted_) {
             throw std::runtime_error("Model not fitted");
         }
@@ -400,14 +400,9 @@ public:
         );
         test_data.apply_bins(*train_data_);
 
-        // Manual prediction to avoid predict_batch_optimized issues on GCC
+        // Manual prediction - return std::vector to avoid py::array_t GCC issues
         const auto& ensemble = booster_->ensemble();
         std::vector<float> predictions(n_samples, 0.0f);
-
-        // Debug: print info about first 3 samples
-        if (config_.verbosity > 0) {
-            py::print("[CPP-DEBUG] n_trees=", ensemble.n_trees(), ", n_samples=", n_samples);
-        }
 
         for (Index row = 0; row < n_samples; ++row) {
             float sum = 0.0f;
@@ -422,36 +417,12 @@ public:
                     BinIndex bin = test_data.binned().get(row, node.split_feature);
                     node_idx = (bin > node.split_bin) ? node.right_child : node.left_child;
                 }
-                float leaf_val = nodes[node_idx].value;
-                sum += leaf_val;
-
-                // Debug first 3 samples, first 2 trees
-                if (config_.verbosity > 0 && row < 3 && t < 2) {
-                    py::print("  row=", row, " tree=", t, " leaf_idx=", node_idx, " leaf_val=", leaf_val);
-                }
+                sum += nodes[node_idx].value;
             }
             predictions[row] = sum + booster_->base_prediction();
-
-            if (config_.verbosity > 0 && row < 3) {
-                py::print("  row=", row, " sum=", sum, " + base=", booster_->base_prediction(), " = ", predictions[row]);
-            }
         }
 
-        // Debug: check variance
-        if (config_.verbosity > 0) {
-            float min_p = predictions[0], max_p = predictions[0];
-            for (Index i = 1; i < n_samples; ++i) {
-                min_p = std::min(min_p, predictions[i]);
-                max_p = std::max(max_p, predictions[i]);
-            }
-            py::print("[CPP-DEBUG] predictions range: [", min_p, ",", max_p, "]");
-        }
-
-        auto result = py::array_t<float>(n_samples);
-        auto result_buf = result.request();
-        std::memcpy(result_buf.ptr, predictions.data(), n_samples * sizeof(float));
-
-        return result;
+        return predictions;
     }
 
     size_t n_trees() const {
