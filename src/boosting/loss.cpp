@@ -39,14 +39,14 @@ void LogLoss::compute_gradients(
     Float* hessians,
     Index n
 ) const {
-    #pragma omp parallel for simd
+    #pragma omp parallel for
     for (Index i = 0; i < n; ++i) {
         Float p = sigmoid(predictions[i]);
         Float y = labels[i];
-        
+
         // Gradient: p - y
         gradients[i] = p - y;
-        
+
         // Hessian: p * (1 - p)
         hessians[i] = std::max(p * (1 - p), 1e-6f);
     }
@@ -133,24 +133,28 @@ void CrossEntropyLoss::compute_multiclass_gradients(
     Float* hessians,
     Index n_samples
 ) const {
-    std::vector<Float> probs(n_classes_);
+    #pragma omp parallel
+    {
+        // Thread-local buffer to avoid firstprivate issues with std::vector on GCC
+        std::vector<Float> probs(n_classes_);
 
-    #pragma omp parallel for firstprivate(probs)
-    for (Index i = 0; i < n_samples; ++i) {
-        // Compute softmax probabilities
-        softmax(predictions + i * n_classes_, probs.data(), n_classes_);
+        #pragma omp for
+        for (Index i = 0; i < n_samples; ++i) {
+            // Compute softmax probabilities
+            softmax(predictions + i * n_classes_, probs.data(), n_classes_);
 
-        Index label = static_cast<Index>(labels[i]);
+            Index label = static_cast<Index>(labels[i]);
 
-        for (uint32_t c = 0; c < n_classes_; ++c) {
-            Float p = probs[c];
-            Float target = (c == label) ? 1.0f : 0.0f;
+            for (uint32_t c = 0; c < n_classes_; ++c) {
+                Float p = probs[c];
+                Float target = (c == label) ? 1.0f : 0.0f;
 
-            // Gradient: p_c - y_c (where y_c is one-hot encoded)
-            gradients[i * n_classes_ + c] = p - target;
+                // Gradient: p_c - y_c (where y_c is one-hot encoded)
+                gradients[i * n_classes_ + c] = p - target;
 
-            // Hessian (diagonal approximation): p_c * (1 - p_c)
-            hessians[i * n_classes_ + c] = std::max(p * (1.0f - p), 1e-6f);
+                // Hessian (diagonal approximation): p_c * (1 - p_c)
+                hessians[i * n_classes_ + c] = std::max(p * (1.0f - p), 1e-6f);
+            }
         }
     }
 }
@@ -190,7 +194,7 @@ void MSELoss::compute_gradients(
     Float* hessians,
     Index n
 ) const {
-    #pragma omp parallel for simd
+    #pragma omp parallel for
     for (Index i = 0; i < n; ++i) {
         // Gradient: 2 * (pred - label)
         gradients[i] = 2.0f * (predictions[i] - labels[i]);
@@ -229,7 +233,7 @@ void MAELoss::compute_gradients(
     Float* hessians,
     Index n
 ) const {
-    #pragma omp parallel for simd
+    #pragma omp parallel for
     for (Index i = 0; i < n; ++i) {
         Float diff = predictions[i] - labels[i];
         // Gradient: sign(pred - label)
@@ -273,11 +277,11 @@ void HuberLoss::compute_gradients(
     Float* hessians,
     Index n
 ) const {
-    #pragma omp parallel for simd
+    #pragma omp parallel for
     for (Index i = 0; i < n; ++i) {
         Float diff = predictions[i] - labels[i];
         Float abs_diff = std::abs(diff);
-        
+
         if (abs_diff <= delta_) {
             gradients[i] = diff;
             hessians[i] = 1.0f;

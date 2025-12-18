@@ -174,6 +174,8 @@ public:
         return config_.tree.use_symmetric ? symmetric_ensemble_.n_trees() : ensemble_.n_trees();
     }
     const Config& config() const { return config_; }
+    Float base_prediction() const { return base_prediction_; }
+    const TreeEnsemble& ensemble() const { return ensemble_; }
     
     /**
      * Get feature importance

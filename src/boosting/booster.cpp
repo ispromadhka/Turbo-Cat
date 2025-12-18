@@ -46,8 +46,20 @@ void Booster::train(
 ) {
     auto start_time = std::chrono::high_resolution_clock::now();
 
+    if (config_.verbosity > 0) {
+        std::printf("[DEBUG] train() started, n_samples=%u, n_features=%u\n",
+                   train_data.n_samples(), train_data.n_features());
+        std::fflush(stdout);
+    }
+
     // Initialize
     initialize_training(train_data);
+
+    if (config_.verbosity > 0) {
+        std::printf("[DEBUG] initialized, base_prediction=%.4f, n_estimators=%u\n",
+                   base_prediction_, config_.boosting.n_estimators);
+        std::fflush(stdout);
+    }
 
     // Store feature info for later prediction
     feature_info_.clear();
@@ -57,6 +69,12 @@ void Booster::train(
 
     // Check if multiclass
     bool is_multiclass = (config_.task == TaskType::MulticlassClassification && config_.n_classes > 2);
+
+    if (config_.verbosity > 0) {
+        std::printf("[DEBUG] is_multiclass=%d, task=%d, n_classes=%u\n",
+                   is_multiclass, static_cast<int>(config_.task), config_.n_classes);
+        std::fflush(stdout);
+    }
 
     if (is_multiclass) {
         // Use multiclass training loop
@@ -91,13 +109,35 @@ void Booster::train(
     best_iteration_ = 0;
     best_valid_loss_ = 1e30f;
     uint32_t no_improvement_count = 0;
-    
+
+    if (config_.verbosity > 0) {
+        std::printf("[DEBUG] Starting main loop, n_estimators=%u\n", config_.boosting.n_estimators);
+        std::fflush(stdout);
+    }
+
     // Main training loop
     for (uint32_t iter = 0; iter < config_.boosting.n_estimators; ++iter) {
         auto iter_start = std::chrono::high_resolution_clock::now();
 
         // Update gradients
         update_gradients(train_data, train_preds);
+
+        // Debug: Check gradients on first iteration
+        if (iter == 0 && config_.verbosity > 0) {
+            Float grad_sum = 0.0f, hess_sum = 0.0f;
+            Float grad_max = 0.0f, grad_min = 0.0f;
+            const Float* grads = train_data.gradients();
+            const Float* hess = train_data.hessians();
+            for (Index i = 0; i < train_data.n_samples(); ++i) {
+                grad_sum += std::abs(grads[i]);
+                hess_sum += hess[i];
+                grad_max = std::max(grad_max, grads[i]);
+                grad_min = std::min(grad_min, grads[i]);
+            }
+            std::printf("[DEBUG] iter=0: grad_sum=%.4f, hess_sum=%.4f, grad_range=[%.4f, %.4f]\n",
+                       grad_sum, hess_sum, grad_min, grad_max);
+            std::fflush(stdout);
+        }
         
         // Quantize gradients if configured
         if (config_.tree.use_quantized_grad) {
@@ -179,12 +219,13 @@ void Booster::train(
         // Logging
         if (config_.verbosity > 0 && (iter + 1) % config_.log_period == 0) {
             auto elapsed = std::chrono::duration<double>(iter_end - start_time).count();
-            
+
             std::printf("[%4u] train_loss: %.6f", iter + 1, train_loss);
             if (valid_data) {
                 std::printf("  valid_loss: %.6f", valid_loss);
             }
             std::printf("  (%.2fs)\n", elapsed);
+            std::fflush(stdout);
         }
         
         // Callback
@@ -208,8 +249,9 @@ void Booster::train(
     if (config_.verbosity > 0) {
         auto end_time = std::chrono::high_resolution_clock::now();
         double total_time = std::chrono::duration<double>(end_time - start_time).count();
-        std::printf("Training completed in %.2fs with %zu trees\n", 
+        std::printf("Training completed in %.2fs with %zu trees\n",
                    total_time, ensemble_.n_trees());
+        std::fflush(stdout);
     }
 }
 
@@ -258,6 +300,26 @@ void Booster::build_tree(
         // Build regular tree
         auto tree = std::make_unique<Tree>(config_.tree);
         tree->build(data, sample_indices, *hist_builder_);
+
+        // Debug: Check tree structure
+        size_t n_nodes = tree->nodes().size();
+        size_t n_leaves = tree->n_leaves();
+        Float first_leaf_value = 0.0f;
+        for (const auto& node : tree->nodes()) {
+            if (node.is_leaf) {
+                first_leaf_value = node.value;
+                break;
+            }
+        }
+
+        // Debug output on first few trees
+        static int debug_tree_count = 0;
+        if (config_.verbosity > 0 && debug_tree_count < 3) {
+            std::printf("[DEBUG] Tree %d: n_nodes=%zu, n_leaves=%zu, first_leaf=%.6f\n",
+                       debug_tree_count, n_nodes, n_leaves, first_leaf_value);
+            std::fflush(stdout);
+            debug_tree_count++;
+        }
 
         // Update predictions
         #pragma omp parallel for
@@ -355,6 +417,12 @@ void Booster::initialize_training(Dataset& data) {
 void Booster::predict_raw(const Dataset& data, Float* output, int n_trees) const {
     Index n_samples = data.n_samples();
 
+    if (config_.verbosity > 0) {
+        std::printf("[DEBUG] predict_raw: n_samples=%u, n_trees=%zu, base_prediction=%.4f\n",
+                   n_samples, ensemble_.n_trees(), base_prediction_);
+        std::fflush(stdout);
+    }
+
     // Use appropriate ensemble based on tree type
     if (config_.tree.use_symmetric) {
         symmetric_ensemble_.predict_batch(data, output);
@@ -362,10 +430,34 @@ void Booster::predict_raw(const Dataset& data, Float* output, int n_trees) const
         ensemble_.predict_batch_optimized(data, output, config_.device.n_threads);
     }
 
+    // Debug: check ensemble output before adding base
+    if (config_.verbosity > 0 && n_samples > 0) {
+        Float min_out = output[0], max_out = output[0], sum_out = 0.0f;
+        for (Index i = 0; i < n_samples; ++i) {
+            min_out = std::min(min_out, output[i]);
+            max_out = std::max(max_out, output[i]);
+            sum_out += output[i];
+        }
+        std::printf("[DEBUG] predict_raw: ensemble output range=[%.6f, %.6f], mean=%.6f\n",
+                   min_out, max_out, sum_out / n_samples);
+        std::fflush(stdout);
+    }
+
     // Add base prediction
-    #pragma omp parallel for simd
+    #pragma omp parallel for
     for (Index i = 0; i < n_samples; ++i) {
         output[i] += base_prediction_;
+    }
+
+    // Debug: check final output
+    if (config_.verbosity > 0 && n_samples > 0) {
+        Float min_out = output[0], max_out = output[0];
+        for (Index i = 0; i < n_samples; ++i) {
+            min_out = std::min(min_out, output[i]);
+            max_out = std::max(max_out, output[i]);
+        }
+        std::printf("[DEBUG] predict_raw: final output range=[%.6f, %.6f]\n", min_out, max_out);
+        std::fflush(stdout);
     }
 }
 
@@ -793,6 +885,7 @@ void Booster::train_multiclass(
                 std::printf("  valid_loss: %.6f", valid_loss);
             }
             std::printf("  (%.2fs)\n", elapsed);
+            std::fflush(stdout);
         }
 
         // Callback
@@ -818,6 +911,7 @@ void Booster::train_multiclass(
         double total_time = std::chrono::duration<double>(end_time - start_time).count();
         std::printf("Training completed in %.2fs with %zu trees\n",
                    total_time, ensemble_.n_trees());
+        std::fflush(stdout);
     }
 }
 

@@ -307,7 +307,7 @@ void Dataset::quantize_gradients() {
     
     quantized_grads_.resize(n_samples_);
     
-    #pragma omp parallel for simd
+    #pragma omp parallel for
     for (Index i = 0; i < n_samples_; ++i) {
         Float normalized = (gradients_[i] - grad_min_) / grad_scale_;
         quantized_grads_[i] = static_cast<QuantizedGrad>(

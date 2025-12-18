@@ -19,7 +19,7 @@ Example:
     >>> predictions = clf.predict_proba(X_test)
 """
 
-__version__ = "0.2.2"
+__version__ = "0.2.4.dev8"
 
 import numpy as np
 
@@ -220,9 +220,13 @@ try:
             y_pred : ndarray of shape (n_samples,)
                 Predicted class labels.
             """
-            X = np.asarray(X, dtype=np.float32)
-            pred = self._model.predict(X)
-            return np.asarray(pred, dtype=np.int32)
+            proba = self.predict_proba(X)
+            if proba.shape[1] == 2:
+                # Binary classification
+                return (proba[:, 1] >= threshold).astype(np.int32)
+            else:
+                # Multiclass classification
+                return np.argmax(proba, axis=1).astype(np.int32)
 
         def feature_importance(self):
             """Get feature importance scores."""
@@ -340,7 +344,16 @@ try:
             """Fit the regressor."""
             X = np.asarray(X, dtype=np.float32)
             y = np.asarray(y, dtype=np.float32)
+
+            if self._params['verbosity'] > 0:
+                print(f"[PY-DEBUG] fit() called: X.shape={X.shape}, y.shape={y.shape}")
+                print(f"[PY-DEBUG] y stats: min={y.min():.4f}, max={y.max():.4f}, mean={y.mean():.4f}, std={y.std():.4f}")
+
             self._model.fit(X, y)
+
+            if self._params['verbosity'] > 0:
+                print(f"[PY-DEBUG] fit() done: n_trees={self._model.n_trees}, base_prediction={self._model.base_prediction:.6f}")
+
             return self
 
         def predict(self, X):
@@ -358,7 +371,54 @@ try:
                 Predicted values.
             """
             X = np.asarray(X, dtype=np.float32)
-            return np.asarray(self._model.predict(X), dtype=np.float32)
+
+            if self._params['verbosity'] > 0:
+                print(f"[PY-DEBUG] predict() called: X.shape={X.shape}")
+                # Check if X has variance (if all same, predictions will be same)
+                x_std = X.std(axis=0)
+                zero_var_features = np.sum(x_std < 1e-6)
+                print(f"[PY-DEBUG] X stats: mean_std={x_std.mean():.4f}, zero_var_features={zero_var_features}")
+
+            preds = np.asarray(self._model.predict(X), dtype=np.float32)
+
+            if self._params['verbosity'] > 0:
+                print(f"[PY-DEBUG] predict() done: preds range=[{preds.min():.6f}, {preds.max():.6f}], unique={len(np.unique(preds))}")
+                if len(np.unique(preds)) == 1:
+                    print(f"[PY-DEBUG] WARNING: All predictions identical! This is likely a bug in binning or tree traversal.")
+
+            return preds
+
+        def debug_info(self):
+            """Get debug information about the model."""
+            info = self._model.debug_info()
+            info['params'] = self._params
+            return info
+
+        def tree_info(self):
+            """Get information about each tree in the ensemble."""
+            return self._model.tree_info()
+
+        def debug_predict(self, X):
+            """
+            Debug prediction - traces bin values and tree paths.
+
+            Returns detailed information about:
+            - Bin variance across samples for each feature
+            - Tree traversal path for first few samples
+            - Comparison of train vs test data ranges
+            """
+            X = np.asarray(X, dtype=np.float32)
+            return self._model.debug_predict(X)
+
+        @property
+        def n_trees(self):
+            """Number of trees in the ensemble."""
+            return self._model.n_trees
+
+        @property
+        def base_prediction_(self):
+            """Base prediction (mean for regression)."""
+            return self._model.base_prediction
 
         def get_params(self, deep=True):
             """Get parameters (sklearn compatibility)."""

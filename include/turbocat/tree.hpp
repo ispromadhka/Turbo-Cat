@@ -391,6 +391,7 @@ public:
     size_t n_trees() const { return trees_.size() + gradtrees_.size(); }
     uint32_t n_classes() const { return n_classes_; }
     void set_n_classes(uint32_t n) { n_classes_ = n; }
+    const Tree& tree(size_t idx) const { return *trees_[idx]; }
 
     // Ensemble sparsification (LP-based thinning)
     void sparsify(Float target_sparsity);

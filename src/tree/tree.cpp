@@ -835,6 +835,31 @@ void TreeEnsemble::predict_batch_optimized(const Dataset& data, Float* output, i
     Index n_samples = data.n_samples();
     size_t n_trees_local = trees_.size();
 
+    // Debug: Check ensemble state
+    static bool debug_printed = false;
+    if (!debug_printed && n_trees_local > 0) {
+        size_t empty_trees = 0;
+        Float total_leaf_sum = 0.0f;
+        int leaf_count = 0;
+        for (size_t t = 0; t < std::min(n_trees_local, size_t(3)); ++t) {
+            const auto& nodes = trees_[t]->nodes();
+            if (nodes.empty()) {
+                empty_trees++;
+            } else {
+                for (const auto& node : nodes) {
+                    if (node.is_leaf) {
+                        total_leaf_sum += node.value;
+                        leaf_count++;
+                    }
+                }
+            }
+        }
+        std::printf("[DEBUG] predict_batch_optimized: n_trees=%zu, empty_trees=%zu, leaf_values_sum=%.6f, leaf_count=%d\n",
+                   n_trees_local, empty_trees, total_leaf_sum, leaf_count);
+        std::fflush(stdout);
+        debug_printed = true;
+    }
+
     if (n_trees_local == 0) {
         std::memset(output, 0, n_samples * sizeof(Float));
         return;
