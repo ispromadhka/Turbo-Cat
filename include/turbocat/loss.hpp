@@ -79,7 +79,7 @@ public:
     virtual const char* name() const = 0;
     
     // Factory
-    static std::unique_ptr<Loss> create(const LossConfig& config, TaskType task);
+    static std::unique_ptr<Loss> create(const LossConfig& config, TaskType task, uint32_t n_classes = 2);
 };
 
 // ============================================================================
@@ -112,17 +112,32 @@ private:
 class CrossEntropyLoss : public Loss {
 public:
     explicit CrossEntropyLoss(uint32_t n_classes) : n_classes_(n_classes) {}
-    
+
     Float compute_loss(const Float* labels, const Float* predictions, Index n) const override;
     void compute_gradients(const Float* labels, const Float* predictions,
                           Float* gradients, Float* hessians, Index n) const override;
     Float transform_prediction(Float raw) const override { return raw; }
     Float init_prediction(const Float* labels, Index n) const override;
     const char* name() const override { return "CrossEntropy"; }
-    
+
+    uint32_t n_classes() const { return n_classes_; }
+
+    // Multiclass-specific: compute gradients for all classes
+    // predictions: n_samples * n_classes, gradients/hessians: n_samples * n_classes
+    void compute_multiclass_gradients(
+        const Float* labels,           // n_samples labels (class indices)
+        const Float* predictions,      // n_samples * n_classes raw scores
+        Float* gradients,              // output: n_samples * n_classes
+        Float* hessians,               // output: n_samples * n_classes
+        Index n_samples
+    ) const;
+
+    // Transform raw scores to probabilities using softmax
+    void transform_to_proba(const Float* raw_scores, Float* proba, Index n_samples) const;
+
 private:
     uint32_t n_classes_;
-    
+
     void softmax(const Float* input, Float* output, uint32_t n) const;
 };
 
@@ -350,13 +365,13 @@ private:
 // Loss Factory
 // ============================================================================
 
-inline std::unique_ptr<Loss> Loss::create(const LossConfig& config, TaskType task) {
+inline std::unique_ptr<Loss> Loss::create(const LossConfig& config, TaskType task, uint32_t n_classes) {
     switch (config.loss_type) {
         case LossType::LogLoss:
             return std::make_unique<LogLoss>();
-        
+
         case LossType::CrossEntropy:
-            return std::make_unique<CrossEntropyLoss>(2);  // TODO: get n_classes
+            return std::make_unique<CrossEntropyLoss>(n_classes);
         
         case LossType::MSE:
             return std::make_unique<MSELoss>();

@@ -75,6 +75,18 @@ if(TURBOCAT_USE_OPENMP)
     find_package(OpenMP)
     if(OpenMP_CXX_FOUND)
         message(STATUS "TurboCat: OpenMP support enabled")
+        message(STATUS "TurboCat: OpenMP include dirs: ${OpenMP_CXX_INCLUDE_DIRS}")
+        # Add OpenMP include directories globally for macOS
+        if(APPLE)
+            # On macOS, we need to explicitly add the libomp include path
+            if(OpenMP_CXX_INCLUDE_DIRS)
+                include_directories(SYSTEM ${OpenMP_CXX_INCLUDE_DIRS})
+            elseif(EXISTS "/opt/homebrew/opt/libomp/include")
+                include_directories(SYSTEM /opt/homebrew/opt/libomp/include)
+            elseif(EXISTS "/usr/local/opt/libomp/include")
+                include_directories(SYSTEM /usr/local/opt/libomp/include)
+            endif()
+        endif()
     else()
         message(WARNING "TurboCat: OpenMP not found, parallel execution disabled")
     endif()
@@ -104,6 +116,8 @@ set(TURBOCAT_CORE_SOURCES
     src/tree/histogram.cpp
     src/tree/splitter.cpp
     src/tree/tree.cpp
+    src/tree/symmetric_tree.cpp
+    src/tree/leaf_wise_tree.cpp
     src/tree/gradtree.cpp
     src/boosting/loss.cpp
     src/boosting/booster.cpp

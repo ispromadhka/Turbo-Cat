@@ -115,14 +115,55 @@ Float CrossEntropyLoss::init_prediction(const Float* labels, Index n) const {
 void CrossEntropyLoss::softmax(const Float* input, Float* output, uint32_t n) const {
     Float max_val = *std::max_element(input, input + n);
     Float sum = 0.0f;
-    
+
     for (uint32_t i = 0; i < n; ++i) {
         output[i] = std::exp(input[i] - max_val);
         sum += output[i];
     }
-    
+
     for (uint32_t i = 0; i < n; ++i) {
         output[i] /= sum;
+    }
+}
+
+void CrossEntropyLoss::compute_multiclass_gradients(
+    const Float* labels,
+    const Float* predictions,
+    Float* gradients,
+    Float* hessians,
+    Index n_samples
+) const {
+    std::vector<Float> probs(n_classes_);
+
+    #pragma omp parallel for firstprivate(probs)
+    for (Index i = 0; i < n_samples; ++i) {
+        // Compute softmax probabilities
+        softmax(predictions + i * n_classes_, probs.data(), n_classes_);
+
+        Index label = static_cast<Index>(labels[i]);
+
+        for (uint32_t c = 0; c < n_classes_; ++c) {
+            Float p = probs[c];
+            Float target = (c == label) ? 1.0f : 0.0f;
+
+            // Gradient: p_c - y_c (where y_c is one-hot encoded)
+            gradients[i * n_classes_ + c] = p - target;
+
+            // Hessian (diagonal approximation): p_c * (1 - p_c)
+            hessians[i * n_classes_ + c] = std::max(p * (1.0f - p), 1e-6f);
+        }
+    }
+}
+
+void CrossEntropyLoss::transform_to_proba(const Float* raw_scores, Float* proba, Index n_samples) const {
+    #pragma omp parallel
+    {
+        std::vector<Float> temp(n_classes_);
+
+        #pragma omp for
+        for (Index i = 0; i < n_samples; ++i) {
+            softmax(raw_scores + i * n_classes_, proba + i * n_classes_, n_classes_);
+        }
     }
 }
 

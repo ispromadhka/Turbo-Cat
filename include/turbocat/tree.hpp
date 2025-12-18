@@ -29,19 +29,32 @@ namespace turbocat {
 class Tree {
 public:
     Tree() = default;
-    explicit Tree(const TreeConfig& config);
-    
+    explicit Tree(const TreeConfig& config, uint32_t n_classes = 1);
+
     // Build tree from histogram
     void build(
         const Dataset& dataset,
         const std::vector<Index>& sample_indices,
         HistogramBuilder& hist_builder
     );
-    
-    // Predict single sample
+
+    // Build tree for multiclass (K gradients/hessians per sample)
+    void build_multiclass(
+        const Dataset& dataset,
+        const std::vector<Index>& sample_indices,
+        HistogramBuilder& hist_builder,
+        const std::vector<Float>& all_gradients,   // n_samples * n_classes
+        const std::vector<Float>& all_hessians     // n_samples * n_classes
+    );
+
+    // Predict single sample (binary/regression)
     Float predict(const Float* features, FeatureIndex n_features) const;
     Float predict(const Dataset& dataset, Index row) const;
-    
+
+    // Predict multiclass (returns K values)
+    void predict_multiclass(const Dataset& dataset, Index row, Float* output) const;
+    void predict_multiclass(const Float* features, FeatureIndex n_features, Float* output) const;
+
     // Batch prediction
     void predict_batch(
         const Float* features,
@@ -49,28 +62,44 @@ public:
         FeatureIndex n_features,
         Float* output
     ) const;
-    
+
+    // Batch multiclass prediction (output: n_samples * n_classes)
+    void predict_batch_multiclass(
+        const Dataset& dataset,
+        Float* output
+    ) const;
+
     // Update leaf values (for refinement)
     void update_leaf_values(const Dataset& dataset, const std::vector<Index>& indices);
-    
+
     // Access tree structure
     const std::vector<TreeNode>& nodes() const { return nodes_; }
     TreeIndex n_nodes() const { return static_cast<TreeIndex>(nodes_.size()); }
     TreeIndex n_leaves() const { return n_leaves_; }
     uint16_t depth() const { return depth_; }
-    
+    uint32_t n_classes() const { return n_classes_; }
+
+    // Access multiclass leaf values
+    const std::vector<Float>& multiclass_leaf_values() const { return multiclass_leaf_values_; }
+
     // Feature importance
     std::vector<Float> feature_importance() const;
-    
+
     // Serialization
     void save(std::ostream& out) const;
     static Tree load(std::istream& in);
-    
+
 private:
     TreeConfig config_;
     std::vector<TreeNode> nodes_;
     TreeIndex n_leaves_ = 0;
     uint16_t depth_ = 0;
+    uint32_t n_classes_ = 1;  // Number of classes (1 for binary/regression)
+
+    // For multiclass: leaf_values[leaf_idx * n_classes + class_idx]
+    // Maps node_idx to leaf_idx for lookup
+    std::vector<Float> multiclass_leaf_values_;
+    std::vector<TreeIndex> node_to_leaf_idx_;  // Maps node index to leaf index
     
     // Build helpers
     void build_recursive(
@@ -82,10 +111,45 @@ private:
         Histogram& histogram,
         uint16_t current_depth
     );
-    
+
+    // Optimized build using pre-computed histogram (histogram subtraction)
+    void build_recursive_with_hist(
+        TreeIndex node_idx,
+        const Dataset& dataset,
+        const std::vector<Index>& indices,
+        const std::vector<FeatureIndex>& features,
+        HistogramBuilder& hist_builder,
+        Histogram& histogram,
+        uint16_t current_depth
+    );
+
+    // Build helpers for multiclass
+    void build_recursive_multiclass(
+        TreeIndex node_idx,
+        const Dataset& dataset,
+        const std::vector<Index>& indices,
+        const std::vector<FeatureIndex>& features,
+        HistogramBuilder& hist_builder,
+        Histogram& histogram,
+        uint16_t current_depth,
+        const std::vector<Float>& all_gradients,
+        const std::vector<Float>& all_hessians
+    );
+
     TreeIndex add_node();
     void make_leaf(TreeIndex node_idx, const GradientPair& stats);
-    
+
+    // Make multiclass leaf (K values per leaf)
+    void make_leaf_multiclass(
+        TreeIndex node_idx,
+        const std::vector<Index>& indices,
+        const std::vector<Float>& all_gradients,
+        const std::vector<Float>& all_hessians
+    );
+
+    // Get leaf index for a sample (traverse tree)
+    TreeIndex get_leaf_idx(const Dataset& dataset, Index row) const;
+
     // Inference helpers
     TreeIndex traverse(const Float* features, const std::vector<Float>& bin_edges,
                        FeatureIndex feature) const;
@@ -301,29 +365,54 @@ private:
 class TreeEnsemble {
 public:
     TreeEnsemble() = default;
-    
+    explicit TreeEnsemble(uint32_t n_classes) : n_classes_(n_classes) {}
+
     void add_tree(std::unique_ptr<Tree> tree, Float weight = 1.0f);
     // void add_gradtree(std::unique_ptr<GradTree> tree, Float weight = 1.0f);
-    
+
+    // Add tree for specific class (multiclass K-trees-per-iteration)
+    void add_tree_for_class(std::unique_ptr<Tree> tree, Float weight, uint32_t class_idx);
+
+    // Binary/regression prediction
     Float predict(const Float* features, FeatureIndex n_features) const;
     Float predict(const Dataset& data, Index row) const;  // Using binned data
-    void predict_batch(const Float* features, Index n_samples, 
+    void predict_batch(const Float* features, Index n_samples,
                        FeatureIndex n_features, Float* output) const;
     void predict_batch(const Dataset& data, Float* output) const;  // Using binned data
-    
+
+    // Optimized batch prediction - processes samples in cache-friendly manner
+    void predict_batch_optimized(const Dataset& data, Float* output, int n_threads = -1) const;
+
+    // Multiclass prediction (K-trees-per-iteration approach)
+    void predict_multiclass(const Dataset& data, Index row, Float* output) const;
+    void predict_batch_multiclass(const Dataset& data, Float* output) const;  // output: n_samples * n_classes
+    void predict_batch_multiclass_optimized(const Dataset& data, Float* output, int n_threads = -1) const;
+
     size_t n_trees() const { return trees_.size() + gradtrees_.size(); }
-    
+    uint32_t n_classes() const { return n_classes_; }
+    void set_n_classes(uint32_t n) { n_classes_ = n; }
+
     // Ensemble sparsification (LP-based thinning)
     void sparsify(Float target_sparsity);
-    
+
     // Feature importance (aggregated)
     std::vector<Float> feature_importance() const;
-    
+
+    // Prepare optimized inference structures
+    void prepare_for_inference();
+
 private:
     std::vector<std::unique_ptr<Tree>> trees_;
     std::vector<std::unique_ptr<GradTree>> gradtrees_;
     std::vector<Float> tree_weights_;
     std::vector<Float> gradtree_weights_;
+    std::vector<uint32_t> tree_class_indices_;  // Which class each tree belongs to (for multiclass)
+    uint32_t n_classes_ = 1;
+
+    // Cached flat representation for fast inference
+    mutable bool inference_prepared_ = false;
+    mutable std::vector<TreeNode> flat_nodes_;  // All nodes from all trees concatenated
+    mutable std::vector<size_t> tree_offsets_;   // Offset into flat_nodes_ for each tree
 };
 
 } // namespace turbocat
