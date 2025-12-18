@@ -46,6 +46,10 @@ struct TreeConfig {
     uint16_t gradtree_iterations = 100;        // Optimization iterations per tree
     Float gradtree_lr = 0.1f;                  // Learning rate for tree parameters
     Float gradtree_momentum = 0.9f;            // Momentum for optimization
+
+    // Tree type
+    bool use_symmetric = false;                // Use oblivious/symmetric trees (CatBoost-style)
+                                               // NOTE: Currently regular trees perform better
 };
 
 // ============================================================================
@@ -162,7 +166,8 @@ struct DeviceConfig {
 
 struct Config {
     TaskType task = TaskType::BinaryClassification;
-    
+    uint32_t n_classes = 2;  // Number of classes (2 for binary, >2 for multiclass)
+
     TreeConfig tree;
     BoostingConfig boosting;
     LossConfig loss;
@@ -197,9 +202,10 @@ struct Config {
         return cfg;
     }
     
-    static Config multiclass_classification(uint32_t n_classes) {
+    static Config multiclass_classification(uint32_t num_classes) {
         Config cfg;
         cfg.task = TaskType::MulticlassClassification;
+        cfg.n_classes = num_classes;
         cfg.loss.loss_type = LossType::CrossEntropy;
         return cfg;
     }
@@ -258,6 +264,12 @@ struct Config {
         }
         if (boosting.subsample <= 0 || boosting.subsample > 1) {
             throw std::invalid_argument("subsample must be in (0, 1]");
+        }
+        if (n_classes < 2) {
+            throw std::invalid_argument("n_classes must be at least 2");
+        }
+        if (task == TaskType::MulticlassClassification && n_classes < 3) {
+            throw std::invalid_argument("MulticlassClassification requires n_classes >= 3");
         }
     }
 };

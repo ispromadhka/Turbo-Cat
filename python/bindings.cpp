@@ -41,18 +41,18 @@ public:
         float colsample_bytree = 0.8f,
         float min_child_weight = 1.0f,
         float lambda_l2 = 1.0f,
-        const std::string& loss = "logloss",
+        const std::string& loss = "auto",
         bool use_goss = true,
         float goss_top_rate = 0.2f,
         float goss_other_rate = 0.1f,
         bool use_gradtree = false,
+        bool use_symmetric = false,  // Oblivious trees (experimental)
         int early_stopping_rounds = 50,
         int n_threads = -1,
         int seed = 42,
         int verbosity = 1
-    ) {
-        config_ = Config::binary_classification();
-        
+    ) : loss_type_str_(loss) {
+        // Will configure properly in fit() when we know n_classes
         config_.boosting.n_estimators = n_estimators;
         config_.boosting.learning_rate = learning_rate;
         config_.tree.max_depth = max_depth;
@@ -65,25 +65,13 @@ public:
         config_.boosting.goss_top_rate = goss_top_rate;
         config_.boosting.goss_other_rate = goss_other_rate;
         config_.tree.use_gradtree = use_gradtree;
+        config_.tree.use_symmetric = use_symmetric;
         config_.boosting.early_stopping_rounds = early_stopping_rounds;
         config_.device.n_threads = n_threads;
         config_.seed = seed;
         config_.verbosity = verbosity;
-        
-        // Parse loss type
-        if (loss == "logloss" || loss == "binary_crossentropy") {
-            config_.loss.loss_type = LossType::LogLoss;
-        } else if (loss == "focal" || loss == "robust_focal") {
-            config_.loss.loss_type = LossType::RobustFocal;
-        } else if (loss == "ldam") {
-            config_.loss.loss_type = LossType::LDAM;
-        } else if (loss == "logit_adjusted") {
-            config_.loss.loss_type = LossType::LogitAdjusted;
-        } else if (loss == "tsallis") {
-            config_.loss.loss_type = LossType::Tsallis;
-        }
     }
-    
+
     void fit(
         py::array_t<float> X,
         py::array_t<float> y,
@@ -93,23 +81,55 @@ public:
     ) {
         auto X_buf = X.request();
         auto y_buf = y.request();
-        
+
         if (X_buf.ndim != 2) {
             throw std::runtime_error("X must be 2-dimensional");
         }
         if (y_buf.ndim != 1) {
             throw std::runtime_error("y must be 1-dimensional");
         }
-        
+
         Index n_samples = static_cast<Index>(X_buf.shape[0]);
         FeatureIndex n_features = static_cast<FeatureIndex>(X_buf.shape[1]);
-        
+
+        // Detect number of classes from labels
+        float* y_ptr = static_cast<float*>(y_buf.ptr);
+        float max_label = 0.0f;
+        for (Index i = 0; i < n_samples; ++i) {
+            max_label = std::max(max_label, y_ptr[i]);
+        }
+        n_classes_ = static_cast<uint32_t>(max_label) + 1;
+
+        // Configure based on n_classes
+        if (n_classes_ <= 2) {
+            config_.task = TaskType::BinaryClassification;
+            config_.n_classes = 2;
+
+            // Parse loss type for binary
+            if (loss_type_str_ == "auto" || loss_type_str_ == "logloss" || loss_type_str_ == "binary_crossentropy") {
+                config_.loss.loss_type = LossType::LogLoss;
+            } else if (loss_type_str_ == "focal" || loss_type_str_ == "robust_focal") {
+                config_.loss.loss_type = LossType::RobustFocal;
+            } else if (loss_type_str_ == "ldam") {
+                config_.loss.loss_type = LossType::LDAM;
+            } else if (loss_type_str_ == "logit_adjusted") {
+                config_.loss.loss_type = LossType::LogitAdjusted;
+            } else if (loss_type_str_ == "tsallis") {
+                config_.loss.loss_type = LossType::Tsallis;
+            }
+        } else {
+            // Multiclass
+            config_.task = TaskType::MulticlassClassification;
+            config_.n_classes = n_classes_;
+            config_.loss.loss_type = LossType::CrossEntropy;
+        }
+
         // Convert cat_features to FeatureIndex
         std::vector<FeatureIndex> cat_features_typed;
         for (int f : cat_features) {
             cat_features_typed.push_back(static_cast<FeatureIndex>(f));
         }
-        
+
         // Create dataset
         train_data_ = std::make_unique<Dataset>();
         train_data_->from_dense(
@@ -121,13 +141,13 @@ public:
             cat_features_typed
         );
         train_data_->compute_bins(config_);
-        
+
         // Validation data
         std::unique_ptr<Dataset> valid_data;
         if (X_val.size() > 0) {
             auto X_val_buf = X_val.request();
             auto y_val_buf = y_val.request();
-            
+
             valid_data = std::make_unique<Dataset>();
             valid_data->from_dense(
                 static_cast<float*>(X_val_buf.ptr),
@@ -137,23 +157,23 @@ public:
             );
             valid_data->apply_bins(*train_data_);
         }
-        
+
         // Train
         booster_ = std::make_unique<Booster>(config_);
         booster_->train(*train_data_, valid_data.get());
-        
+
         is_fitted_ = true;
     }
-    
-    std::vector<float> predict_proba(py::array_t<float> X) {
+
+    py::array_t<float> predict_proba(py::array_t<float> X) {
         if (!is_fitted_) {
             throw std::runtime_error("Model not fitted. Call fit() first.");
         }
-        
+
         auto X_buf = X.request();
         Index n_samples = static_cast<Index>(X_buf.shape[0]);
         FeatureIndex n_features = static_cast<FeatureIndex>(X_buf.shape[1]);
-        
+
         Dataset test_data;
         test_data.from_dense(
             static_cast<float*>(X_buf.ptr),
@@ -161,25 +181,77 @@ public:
             n_features
         );
         test_data.apply_bins(*train_data_);
-        
-        // Return vector - pybind11 will convert to numpy
-        std::vector<float> output(n_samples);
-        booster_->predict_proba(test_data, output.data());
-        
-        return output;
+
+        if (n_classes_ > 2) {
+            // Multiclass: return (n_samples, n_classes)
+            auto result = py::array_t<float>({n_samples, static_cast<Index>(n_classes_)});
+            auto result_buf = result.request();
+            booster_->predict_proba_multiclass(test_data, static_cast<float*>(result_buf.ptr));
+            return result;
+        } else {
+            // Binary: return (n_samples, 2) for sklearn compatibility
+            std::vector<float> proba_1(n_samples);
+            booster_->predict_proba(test_data, proba_1.data());
+
+            auto result = py::array_t<float>({n_samples, static_cast<Index>(2)});
+            auto result_buf = result.request();
+            float* r = static_cast<float*>(result_buf.ptr);
+
+            for (Index i = 0; i < n_samples; ++i) {
+                r[i * 2] = 1.0f - proba_1[i];      // P(class=0)
+                r[i * 2 + 1] = proba_1[i];         // P(class=1)
+            }
+            return result;
+        }
     }
-    
-    py::array_t<int> predict(py::array_t<float> X, float threshold = 0.5f) {
-        auto proba = predict_proba(X);  // Now returns std::vector<float>
-        
-        auto result = py::array_t<int>(proba.size());
+
+    py::array_t<int> predict(py::array_t<float> X) {
+        if (!is_fitted_) {
+            throw std::runtime_error("Model not fitted. Call fit() first.");
+        }
+
+        auto X_buf = X.request();
+        Index n_samples = static_cast<Index>(X_buf.shape[0]);
+        FeatureIndex n_features = static_cast<FeatureIndex>(X_buf.shape[1]);
+
+        Dataset test_data;
+        test_data.from_dense(
+            static_cast<float*>(X_buf.ptr),
+            n_samples,
+            n_features
+        );
+        test_data.apply_bins(*train_data_);
+
+        auto result = py::array_t<int>(n_samples);
         auto result_buf = result.request();
         int* r = static_cast<int*>(result_buf.ptr);
-        
-        for (size_t i = 0; i < proba.size(); ++i) {
-            r[i] = proba[i] >= threshold ? 1 : 0;
+
+        if (n_classes_ > 2) {
+            // Multiclass: argmax
+            std::vector<float> proba(n_samples * n_classes_);
+            booster_->predict_proba_multiclass(test_data, proba.data());
+
+            for (Index i = 0; i < n_samples; ++i) {
+                int best_class = 0;
+                float best_prob = proba[i * n_classes_];
+                for (uint32_t c = 1; c < n_classes_; ++c) {
+                    if (proba[i * n_classes_ + c] > best_prob) {
+                        best_prob = proba[i * n_classes_ + c];
+                        best_class = c;
+                    }
+                }
+                r[i] = best_class;
+            }
+        } else {
+            // Binary: threshold at 0.5
+            std::vector<float> proba(n_samples);
+            booster_->predict_proba(test_data, proba.data());
+
+            for (Index i = 0; i < n_samples; ++i) {
+                r[i] = proba[i] >= 0.5f ? 1 : 0;
+            }
         }
-        
+
         return result;
     }
     
@@ -224,13 +296,18 @@ public:
         params["lambda_l2"] = config_.tree.lambda_l2;
         params["use_goss"] = config_.boosting.use_goss;
         params["use_gradtree"] = config_.tree.use_gradtree;
+        params["n_classes"] = n_classes_;
         return params;
     }
-    
+
+    uint32_t n_classes() const { return n_classes_; }
+
 private:
     Config config_;
     std::unique_ptr<Booster> booster_;
     std::unique_ptr<Dataset> train_data_;
+    std::string loss_type_str_;
+    uint32_t n_classes_ = 2;
     bool is_fitted_ = false;
 };
 
@@ -245,17 +322,31 @@ public:
         float learning_rate = 0.05f,
         int max_depth = 6,
         const std::string& loss = "mse",
+        float subsample = 0.8f,
+        float colsample_bytree = 0.8f,
+        bool use_goss = true,
+        float goss_top_rate = 0.2f,
+        float goss_other_rate = 0.1f,
+        int early_stopping_rounds = 50,
+        int n_threads = -1,
         int seed = 42,
         int verbosity = 1
     ) {
         config_ = Config::regression();
-        
+
         config_.boosting.n_estimators = n_estimators;
         config_.boosting.learning_rate = learning_rate;
         config_.tree.max_depth = max_depth;
+        config_.boosting.subsample = subsample;
+        config_.boosting.colsample_bytree = colsample_bytree;
+        config_.boosting.use_goss = use_goss;
+        config_.boosting.goss_top_rate = goss_top_rate;
+        config_.boosting.goss_other_rate = goss_other_rate;
+        config_.boosting.early_stopping_rounds = early_stopping_rounds;
+        config_.device.n_threads = n_threads;
         config_.seed = seed;
         config_.verbosity = verbosity;
-        
+
         if (loss == "mse" || loss == "l2") {
             config_.loss.loss_type = LossType::MSE;
         } else if (loss == "mae" || loss == "l1") {
@@ -332,7 +423,7 @@ PYBIND11_MODULE(_turbocat, m) {
     // Classifier
     py::class_<TurboCatClassifier>(m, "TurboCatClassifier")
         .def(py::init<int, float, int, int, float, float, float, float,
-                      const std::string&, bool, float, float, bool, int, int, int, int>(),
+                      const std::string&, bool, float, float, bool, bool, int, int, int, int>(),
              py::arg("n_estimators") = 1000,
              py::arg("learning_rate") = 0.05f,
              py::arg("max_depth") = 6,
@@ -346,6 +437,7 @@ PYBIND11_MODULE(_turbocat, m) {
              py::arg("goss_top_rate") = 0.2f,
              py::arg("goss_other_rate") = 0.1f,
              py::arg("use_gradtree") = false,
+             py::arg("use_symmetric") = false,
              py::arg("early_stopping_rounds") = 50,
              py::arg("n_threads") = -1,
              py::arg("seed") = 42,
@@ -357,8 +449,7 @@ PYBIND11_MODULE(_turbocat, m) {
              py::arg("y_val") = py::array_t<float>(),
              py::arg("cat_features") = std::vector<int>())
         .def("predict", &TurboCatClassifier::predict,
-             py::arg("X"),
-             py::arg("threshold") = 0.5f)
+             py::arg("X"))
         .def("predict_proba", &TurboCatClassifier::predict_proba)
         .def("feature_importance", &TurboCatClassifier::feature_importance)
         .def("save", &TurboCatClassifier::save)
@@ -368,11 +459,18 @@ PYBIND11_MODULE(_turbocat, m) {
     
     // Regressor
     py::class_<TurboCatRegressor>(m, "TurboCatRegressor")
-        .def(py::init<int, float, int, const std::string&, int, int>(),
+        .def(py::init<int, float, int, const std::string&, float, float, bool, float, float, int, int, int, int>(),
              py::arg("n_estimators") = 1000,
              py::arg("learning_rate") = 0.05f,
              py::arg("max_depth") = 6,
              py::arg("loss") = "mse",
+             py::arg("subsample") = 0.8f,
+             py::arg("colsample_bytree") = 0.8f,
+             py::arg("use_goss") = true,
+             py::arg("goss_top_rate") = 0.2f,
+             py::arg("goss_other_rate") = 0.1f,
+             py::arg("early_stopping_rounds") = 50,
+             py::arg("n_threads") = -1,
              py::arg("seed") = 42,
              py::arg("verbosity") = 1)
         .def("fit", &TurboCatRegressor::fit)

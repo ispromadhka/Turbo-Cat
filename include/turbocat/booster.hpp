@@ -18,6 +18,7 @@
 #include "dataset.hpp"
 #include "histogram.hpp"
 #include "tree.hpp"
+#include "symmetric_tree.hpp"
 #include "loss.hpp"
 #include <memory>
 #include <vector>
@@ -117,18 +118,36 @@ public:
     // ========================================================================
     
     /**
-     * Predict raw scores
+     * Predict raw scores (binary/regression)
      */
     void predict_raw(
         const Dataset& data,
         Float* output,
         int n_trees = -1  // -1 = all trees
     ) const;
-    
+
     /**
-     * Predict probabilities (classification)
+     * Predict raw scores (multiclass): output is n_samples * n_classes
+     */
+    void predict_raw_multiclass(
+        const Dataset& data,
+        Float* output,
+        int n_trees = -1
+    ) const;
+
+    /**
+     * Predict probabilities (binary classification)
      */
     void predict_proba(
+        const Dataset& data,
+        Float* output,
+        int n_trees = -1
+    ) const;
+
+    /**
+     * Predict probabilities (multiclass): output is n_samples * n_classes
+     */
+    void predict_proba_multiclass(
         const Dataset& data,
         Float* output,
         int n_trees = -1
@@ -151,7 +170,9 @@ public:
     // Model Information
     // ========================================================================
     
-    size_t n_trees() const { return ensemble_.n_trees(); }
+    size_t n_trees() const {
+        return config_.tree.use_symmetric ? symmetric_ensemble_.n_trees() : ensemble_.n_trees();
+    }
     const Config& config() const { return config_; }
     
     /**
@@ -208,11 +229,13 @@ public:
 private:
     Config config_;
     TreeEnsemble ensemble_;
+    SymmetricEnsemble symmetric_ensemble_;  // For use_symmetric=true
     std::unique_ptr<Loss> loss_;
     std::unique_ptr<HistogramBuilder> hist_builder_;
     
     // Training state
     Float base_prediction_ = 0.0f;
+    std::vector<Float> base_predictions_multiclass_;  // For multiclass: K base predictions
     TrainingHistory history_;
     uint32_t best_iteration_ = 0;
     Float best_valid_loss_ = 1e30f;
@@ -229,13 +252,25 @@ private:
     // ========================================================================
     
     /**
-     * Build single tree and add to ensemble
+     * Build single tree and add to ensemble (binary/regression)
      */
     void build_tree(
         Dataset& data,
         const std::vector<Index>& sample_indices,
         const std::vector<FeatureIndex>& feature_indices,
         AlignedVector<Float>& predictions
+    );
+
+    /**
+     * Build single tree for multiclass and add to ensemble
+     */
+    void build_tree_multiclass(
+        Dataset& data,
+        const std::vector<Index>& sample_indices,
+        const std::vector<FeatureIndex>& feature_indices,
+        std::vector<Float>& predictions,  // n_samples * n_classes
+        const std::vector<Float>& gradients,  // n_samples * n_classes
+        const std::vector<Float>& hessians   // n_samples * n_classes
     );
     
     /**
@@ -276,6 +311,15 @@ private:
      * Initialize loss and base prediction
      */
     void initialize_training(Dataset& data);
+
+    /**
+     * Multiclass training loop
+     */
+    void train_multiclass(
+        Dataset& train_data,
+        Dataset* valid_data,
+        TrainingCallback callback
+    );
 };
 
 // ============================================================================

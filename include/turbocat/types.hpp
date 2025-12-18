@@ -1,5 +1,5 @@
 #pragma once
-#include <cmath>
+
 /**
  * TurboCat: Next-Generation Gradient Boosting Framework
  * 

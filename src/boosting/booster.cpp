@@ -45,17 +45,26 @@ void Booster::train(
     TrainingCallback callback
 ) {
     auto start_time = std::chrono::high_resolution_clock::now();
-    
+
     // Initialize
     initialize_training(train_data);
-    
+
     // Store feature info for later prediction
     feature_info_.clear();
     for (FeatureIndex f = 0; f < train_data.n_features(); ++f) {
         feature_info_.push_back(train_data.feature_info(f));
     }
-    
-    // Predictions array
+
+    // Check if multiclass
+    bool is_multiclass = (config_.task == TaskType::MulticlassClassification && config_.n_classes > 2);
+
+    if (is_multiclass) {
+        // Use multiclass training loop
+        train_multiclass(train_data, valid_data, callback);
+        return;
+    }
+
+    // Predictions array (binary/regression)
     AlignedVector<Float> train_preds(train_data.n_samples(), base_prediction_);
     AlignedVector<Float> valid_preds;
     if (valid_data) {
@@ -228,19 +237,37 @@ void Booster::build_tree(
     const std::vector<FeatureIndex>& feature_indices,
     AlignedVector<Float>& predictions
 ) {
-    auto tree = std::make_unique<Tree>(config_.tree);
-    tree->build(data, sample_indices, *hist_builder_);
-    
-    // Update predictions
     Float lr = config_.boosting.learning_rate;
-    
-    #pragma omp parallel for
-    for (Index i = 0; i < data.n_samples(); ++i) {
-        Float tree_pred = tree->predict(data, i);
-        predictions[i] += lr * tree_pred;
+
+    if (config_.tree.use_symmetric) {
+        // Build symmetric (oblivious) tree for faster inference
+        auto tree = std::make_unique<SymmetricTree>(config_.tree);
+        tree->build(data, sample_indices, *hist_builder_);
+
+        // Update predictions using batch method (faster)
+        std::vector<Float> tree_preds(data.n_samples());
+        tree->predict_batch(data, tree_preds.data());
+
+        #pragma omp parallel for
+        for (Index i = 0; i < data.n_samples(); ++i) {
+            predictions[i] += lr * tree_preds[i];
+        }
+
+        symmetric_ensemble_.add_tree(std::move(tree), lr);
+    } else {
+        // Build regular tree
+        auto tree = std::make_unique<Tree>(config_.tree);
+        tree->build(data, sample_indices, *hist_builder_);
+
+        // Update predictions
+        #pragma omp parallel for
+        for (Index i = 0; i < data.n_samples(); ++i) {
+            Float tree_pred = tree->predict(data, i);
+            predictions[i] += lr * tree_pred;
+        }
+
+        ensemble_.add_tree(std::move(tree), lr);
     }
-    
-    ensemble_.add_tree(std::move(tree), lr);
 }
 
 // ============================================================================
@@ -289,7 +316,7 @@ std::vector<Index> Booster::goss_sample(
 
 void Booster::initialize_training(Dataset& data) {
     // Create loss function
-    loss_ = Loss::create(config_.loss, config_.task);
+    loss_ = Loss::create(config_.loss, config_.task, config_.n_classes);
     
     // Set class-specific loss parameters
     if (config_.loss.loss_type == LossType::LDAM && config_.loss.auto_ldam_margins) {
@@ -326,12 +353,19 @@ void Booster::initialize_training(Dataset& data) {
 // ============================================================================
 
 void Booster::predict_raw(const Dataset& data, Float* output, int n_trees) const {
-    std::memset(output, 0, data.n_samples() * sizeof(Float));
-    
-    #pragma omp parallel for
-    for (Index i = 0; i < data.n_samples(); ++i) {
-        Float tree_pred = ensemble_.predict(data, i);
-        output[i] = base_prediction_ + tree_pred;
+    Index n_samples = data.n_samples();
+
+    // Use appropriate ensemble based on tree type
+    if (config_.tree.use_symmetric) {
+        symmetric_ensemble_.predict_batch(data, output);
+    } else {
+        ensemble_.predict_batch_optimized(data, output, config_.device.n_threads);
+    }
+
+    // Add base prediction
+    #pragma omp parallel for simd
+    for (Index i = 0; i < n_samples; ++i) {
+        output[i] += base_prediction_;
     }
 }
 
@@ -368,7 +402,13 @@ std::vector<Prediction> Booster::predict_with_uncertainty(
 }
 
 Float Booster::predict_single(const Float* features, FeatureIndex n_features) const {
-    Float raw = base_prediction_ + ensemble_.predict(features, n_features);
+    Float raw;
+    if (config_.tree.use_symmetric) {
+        // For symmetric trees, use base prediction only (single sample prediction not optimized)
+        raw = base_prediction_;  // TODO: implement single prediction for symmetric trees
+    } else {
+        raw = base_prediction_ + ensemble_.predict(features, n_features);
+    }
     return loss_->transform_prediction(raw);
 }
 
@@ -378,21 +418,26 @@ Float Booster::predict_single(const Float* features, FeatureIndex n_features) co
 
 FeatureImportance Booster::feature_importance() const {
     FeatureImportance imp;
-    
-    auto raw_importance = ensemble_.feature_importance();
-    
+
+    std::vector<Float> raw_importance;
+    if (config_.tree.use_symmetric) {
+        raw_importance = symmetric_ensemble_.feature_importance();
+    } else {
+        raw_importance = ensemble_.feature_importance();
+    }
+
     imp.gain = raw_importance;
-    
+
     // Normalize
     Float sum = std::accumulate(raw_importance.begin(), raw_importance.end(), 0.0f);
-    
+
     imp.gain_normalized.resize(raw_importance.size());
     if (sum > 0) {
         for (size_t i = 0; i < raw_importance.size(); ++i) {
             imp.gain_normalized[i] = raw_importance[i] / sum;
         }
     }
-    
+
     return imp;
 }
 
@@ -558,6 +603,287 @@ GridSearchResult grid_search(
     }
     
     return result;
+}
+
+// ============================================================================
+// Multiclass Training
+// ============================================================================
+
+void Booster::train_multiclass(
+    Dataset& train_data,
+    Dataset* valid_data,
+    TrainingCallback callback
+) {
+    auto start_time = std::chrono::high_resolution_clock::now();
+
+    uint32_t n_classes = config_.n_classes;
+    Index n_train = train_data.n_samples();
+
+    // Set ensemble n_classes
+    ensemble_.set_n_classes(n_classes);
+
+    // Initialize base predictions (zeros for softmax)
+    base_predictions_multiclass_.resize(n_classes, 0.0f);
+
+    // Predictions arrays: n_samples * n_classes
+    std::vector<Float> train_preds(n_train * n_classes, 0.0f);
+    std::vector<Float> valid_preds;
+    if (valid_data) {
+        valid_preds.resize(valid_data->n_samples() * n_classes, 0.0f);
+    }
+
+    // Gradients and hessians: n_samples * n_classes
+    std::vector<Float> gradients(n_train * n_classes);
+    std::vector<Float> hessians(n_train * n_classes);
+
+    // All sample indices
+    std::vector<Index> all_indices(n_train);
+    std::iota(all_indices.begin(), all_indices.end(), 0);
+
+    // All feature indices
+    std::vector<FeatureIndex> all_features(train_data.n_features());
+    std::iota(all_features.begin(), all_features.end(), static_cast<FeatureIndex>(0));
+
+    // Get loss function (CrossEntropyLoss)
+    auto* ce_loss = dynamic_cast<CrossEntropyLoss*>(loss_.get());
+    if (!ce_loss) {
+        throw std::runtime_error("Multiclass training requires CrossEntropyLoss");
+    }
+
+    // Training history
+    history_.train_loss.clear();
+    history_.valid_loss.clear();
+    history_.iteration_time.clear();
+
+    best_iteration_ = 0;
+    best_valid_loss_ = 1e30f;
+    uint32_t no_improvement_count = 0;
+
+    // Main training loop
+    for (uint32_t iter = 0; iter < config_.boosting.n_estimators; ++iter) {
+        auto iter_start = std::chrono::high_resolution_clock::now();
+
+        // Compute multiclass gradients
+        ce_loss->compute_multiclass_gradients(
+            train_data.labels().data(),
+            train_preds.data(),
+            gradients.data(),
+            hessians.data(),
+            n_train
+        );
+
+        // Sample selection (shared across all K trees for this iteration)
+        std::vector<Index> sample_indices;
+        if (config_.boosting.use_goss) {
+            // For GOSS, use max absolute gradient across classes
+            AlignedVector<Float> max_grads(n_train);
+            AlignedVector<Float> sum_hess(n_train);
+            #pragma omp parallel for
+            for (Index i = 0; i < n_train; ++i) {
+                Float max_g = 0.0f;
+                Float h_sum = 0.0f;
+                for (uint32_t c = 0; c < n_classes; ++c) {
+                    max_g = std::max(max_g, std::abs(gradients[i * n_classes + c]));
+                    h_sum += hessians[i * n_classes + c];
+                }
+                max_grads[i] = max_g;
+                sum_hess[i] = h_sum;
+            }
+            train_data.set_gradients(std::move(max_grads), std::move(sum_hess));
+            sample_indices = goss_sample(
+                train_data,
+                config_.boosting.goss_top_rate,
+                config_.boosting.goss_other_rate
+            );
+        } else if (config_.boosting.subsample < 1.0f) {
+            sample_indices = train_data.random_subsample(
+                config_.boosting.subsample, next_random()
+            );
+        } else {
+            sample_indices = all_indices;
+        }
+
+        // Feature selection
+        std::vector<FeatureIndex> feature_indices;
+        if (config_.boosting.colsample_bytree < 1.0f) {
+            feature_indices = train_data.random_feature_subsample(
+                config_.boosting.colsample_bytree, next_random()
+            );
+        } else {
+            feature_indices = all_features;
+        }
+
+        // Build K trees - one per class (like XGBoost/LightGBM)
+        for (uint32_t k = 0; k < n_classes; ++k) {
+            // Set gradients for class k
+            AlignedVector<Float> class_grads(n_train);
+            AlignedVector<Float> class_hess(n_train);
+            #pragma omp parallel for
+            for (Index i = 0; i < n_train; ++i) {
+                class_grads[i] = gradients[i * n_classes + k];
+                class_hess[i] = hessians[i * n_classes + k];
+            }
+            train_data.set_gradients(std::move(class_grads), std::move(class_hess));
+
+            // Build tree for class k
+            auto tree = std::make_unique<Tree>(config_.tree);
+            tree->build(train_data, sample_indices, *hist_builder_);
+
+            // Update predictions for class k
+            Float lr = config_.boosting.learning_rate;
+            #pragma omp parallel for
+            for (Index i = 0; i < n_train; ++i) {
+                Float tree_pred = tree->predict(train_data, i);
+                train_preds[i * n_classes + k] += lr * tree_pred;
+            }
+
+            // Store tree with class index
+            ensemble_.add_tree_for_class(std::move(tree), lr, k);
+        }
+
+        // Compute training loss
+        Float train_loss = ce_loss->compute_loss(
+            train_data.labels().data(),
+            train_preds.data(),
+            n_train
+        );
+        history_.train_loss.push_back(train_loss);
+
+        // Validation
+        Float valid_loss = 0.0f;
+        if (valid_data) {
+            // Update validation predictions
+            ensemble_.predict_batch_multiclass(*valid_data, valid_preds.data());
+
+            valid_loss = ce_loss->compute_loss(
+                valid_data->labels().data(),
+                valid_preds.data(),
+                valid_data->n_samples()
+            );
+            history_.valid_loss.push_back(valid_loss);
+
+            // Early stopping
+            if (valid_loss < best_valid_loss_ - config_.boosting.early_stopping_tolerance) {
+                best_valid_loss_ = valid_loss;
+                best_iteration_ = iter;
+                no_improvement_count = 0;
+            } else {
+                no_improvement_count++;
+            }
+
+            if (no_improvement_count >= config_.boosting.early_stopping_rounds) {
+                if (config_.verbosity > 0) {
+                    std::printf("Early stopping at iteration %u (best: %u)\n",
+                               iter, best_iteration_);
+                }
+                break;
+            }
+        }
+
+        auto iter_end = std::chrono::high_resolution_clock::now();
+        double iter_time = std::chrono::duration<double>(iter_end - iter_start).count();
+        history_.iteration_time.push_back(iter_time);
+
+        // Logging
+        if (config_.verbosity > 0 && (iter + 1) % config_.log_period == 0) {
+            auto elapsed = std::chrono::duration<double>(iter_end - start_time).count();
+
+            std::printf("[%4u] train_loss: %.6f", iter + 1, train_loss);
+            if (valid_data) {
+                std::printf("  valid_loss: %.6f", valid_loss);
+            }
+            std::printf("  (%.2fs)\n", elapsed);
+        }
+
+        // Callback
+        if (callback) {
+            TrainingInfo info;
+            info.iteration = iter;
+            info.train_loss = train_loss;
+            info.valid_loss = valid_loss;
+            info.best_valid_loss = best_valid_loss_;
+            info.best_iteration = best_iteration_;
+            info.elapsed_seconds = std::chrono::duration<double>(
+                iter_end - start_time).count();
+            info.n_trees = ensemble_.n_trees();
+
+            if (!callback(info)) {
+                break;
+            }
+        }
+    }
+
+    if (config_.verbosity > 0) {
+        auto end_time = std::chrono::high_resolution_clock::now();
+        double total_time = std::chrono::duration<double>(end_time - start_time).count();
+        std::printf("Training completed in %.2fs with %zu trees\n",
+                   total_time, ensemble_.n_trees());
+    }
+}
+
+void Booster::build_tree_multiclass(
+    Dataset& data,
+    const std::vector<Index>& sample_indices,
+    const std::vector<FeatureIndex>& feature_indices,
+    std::vector<Float>& predictions,
+    const std::vector<Float>& gradients,
+    const std::vector<Float>& hessians
+) {
+    uint32_t n_classes = config_.n_classes;
+
+    auto tree = std::make_unique<Tree>(config_.tree, n_classes);
+    tree->build_multiclass(data, sample_indices, *hist_builder_, gradients, hessians);
+
+    // Update predictions
+    Float lr = config_.boosting.learning_rate;
+    Index n_samples = data.n_samples();
+
+    #pragma omp parallel
+    {
+        std::vector<Float> tree_pred(n_classes);
+
+        #pragma omp for
+        for (Index i = 0; i < n_samples; ++i) {
+            tree->predict_multiclass(data, i, tree_pred.data());
+            for (uint32_t c = 0; c < n_classes; ++c) {
+                predictions[i * n_classes + c] += lr * tree_pred[c];
+            }
+        }
+    }
+
+    ensemble_.add_tree(std::move(tree), lr);
+}
+
+void Booster::predict_raw_multiclass(const Dataset& data, Float* output, int n_trees) const {
+    Index n_samples = data.n_samples();
+    uint32_t n_classes = config_.n_classes;
+
+    // Use appropriate ensemble based on tree type
+    if (config_.tree.use_symmetric) {
+        symmetric_ensemble_.predict_batch_multiclass(data, output);
+    } else {
+        ensemble_.predict_batch_multiclass_optimized(data, output, config_.device.n_threads);
+    }
+
+    // Add base predictions
+    if (!base_predictions_multiclass_.empty()) {
+        #pragma omp parallel for
+        for (Index i = 0; i < n_samples; ++i) {
+            for (uint32_t c = 0; c < n_classes; ++c) {
+                output[i * n_classes + c] += base_predictions_multiclass_[c];
+            }
+        }
+    }
+}
+
+void Booster::predict_proba_multiclass(const Dataset& data, Float* output, int n_trees) const {
+    predict_raw_multiclass(data, output, n_trees);
+
+    // Transform to probabilities using softmax
+    auto* ce_loss = dynamic_cast<CrossEntropyLoss*>(loss_.get());
+    if (ce_loss) {
+        ce_loss->transform_to_proba(output, output, data.n_samples());
+    }
 }
 
 } // namespace turbocat

@@ -66,11 +66,12 @@ void CPUHistogramBuilder::build(
     Histogram& output
 ) {
     output.clear();
-    
+
     FeatureIndex n_features = dataset.n_features();
     const Float* gradients = dataset.gradients();
     const Float* hessians = dataset.hessians();
-    
+    BinIndex max_bins = output.max_bins();
+
     // Build list of features to process
     std::vector<FeatureIndex> features_to_process;
     if (feature_indices.empty()) {
@@ -81,70 +82,18 @@ void CPUHistogramBuilder::build(
     } else {
         features_to_process = feature_indices;
     }
-    
-    // For small sample sets or single thread, use optimized sequential version
-    if (sample_indices.size() < MIN_SAMPLES_FOR_PARALLEL || n_threads_ == 1) {
-        for (FeatureIndex f : features_to_process) {
-            #ifdef TURBOCAT_AVX2
-            if (use_simd_) {
-                build_feature_avx2(
-                    dataset.binned().column(f),
-                    gradients,
-                    hessians,
-                    sample_indices,
-                    output.bins(f)
-                );
-            } else
-            #endif
-            {
-                build_feature_scalar(
-                    dataset.binned().column(f),
-                    gradients,
-                    hessians,
-                    sample_indices,
-                    output.bins(f)
-                );
-            }
-        }
-        return;
-    }
-    
-    // Feature-parallel histogram building (more efficient than data-parallel)
+
+    // Feature-parallel histogram building
     #pragma omp parallel for schedule(static) num_threads(n_threads_)
     for (size_t fi = 0; fi < features_to_process.size(); ++fi) {
         FeatureIndex f = features_to_process[fi];
-        
-        #ifdef TURBOCAT_AVX512
-        if (use_simd_) {
-            build_feature_avx512(
-                dataset.binned().column(f),
-                gradients,
-                hessians,
-                sample_indices,
-                output.bins(f)
-            );
-        } else
-        #endif
-        #ifdef TURBOCAT_AVX2
-        if (use_simd_) {
-            build_feature_avx2(
-                dataset.binned().column(f),
-                gradients,
-                hessians,
-                sample_indices,
-                output.bins(f)
-            );
-        } else
-        #endif
-        {
-            build_feature_scalar(
-                dataset.binned().column(f),
-                gradients,
-                hessians,
-                sample_indices,
-                output.bins(f)
-            );
-        }
+        build_feature_scalar(
+            dataset.binned().column(f),
+            gradients,
+            hessians,
+            sample_indices,
+            output.bins(f)
+        );
     }
 }
 

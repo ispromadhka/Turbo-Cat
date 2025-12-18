@@ -224,9 +224,7 @@ void Dataset::compute_quantile_bins(FeatureIndex feature, BinIndex n_bins) {
     values.erase(last, values.end());
     
     // Compute bin edges using quantiles
-    BinIndex actual_bins = static_cast<BinIndex>(
-    std::min(static_cast<size_t>(n_bins), values.size())
-        );
+    BinIndex actual_bins = std::min(n_bins, static_cast<BinIndex>(values.size()));
     std::vector<Float>& edges = bin_edges_[feature];
     edges.clear();
     edges.reserve(actual_bins);
