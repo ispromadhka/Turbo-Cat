@@ -8,7 +8,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "turbocat"
-version = "0.2.4"
+version = "0.2.5"
 description = "Next-Generation Gradient Boosting Framework - Outperforms CatBoost on model quality"
 readme = "README.md"
 license = {text = "MIT"}

@@ -255,10 +255,10 @@ uint32_t SymmetricTree::get_leaf_index(const Dataset& dataset, Index row) const 
         const SymmetricSplit& split = splits_[d];
         BinIndex bin = dataset.binned().column(split.feature)[row];
 
-        // Bit d is 1 if we go right, 0 if we go left
-        if (bin != 255 && bin > split.threshold) {
-            leaf_idx |= (1u << d);
-        }
+        // Must match training indexing: leaf_idx = 2*parent + direction
+        // This is equivalent to: leaf_idx = (leaf_idx << 1) | direction
+        bool go_right = (bin != 255 && bin > split.threshold);
+        leaf_idx = (leaf_idx << 1) | (go_right ? 1u : 0u);
     }
 
     return leaf_idx;
@@ -304,9 +304,9 @@ void SymmetricTree::predict_batch(const Dataset& dataset, Float* output) const {
             const SymmetricSplit& split = splits_[d];
             BinIndex bin = dataset.binned().column(split.feature)[i];
 
-            if (bin != 255 && bin > split.threshold) {
-                leaf_idx |= (1u << d);
-            }
+            // Must match training indexing: leaf_idx = 2*parent + direction
+            bool go_right = (bin != 255 && bin > split.threshold);
+            leaf_idx = (leaf_idx << 1) | (go_right ? 1u : 0u);
         }
 
         output[i] = leaf_values_[leaf_idx];
