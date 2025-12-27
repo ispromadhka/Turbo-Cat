@@ -115,9 +115,50 @@ void Booster::train(
         std::fflush(stdout);
     }
 
+    // Ordered Boosting setup: create permutation folds
+    const uint8_t n_perms = config_.boosting.n_permutations;
+    std::vector<std::vector<Index>> perm_folds;
+    std::vector<AlignedVector<Float>> perm_preds;  // Separate predictions per permutation
+
+    if (config_.boosting.use_ordered_boosting) {
+        // Create shuffled fold assignments
+        std::vector<Index> shuffled = all_indices;
+        std::mt19937_64 rng(config_.seed);
+        std::shuffle(shuffled.begin(), shuffled.end(), rng);
+
+        // Assign to folds
+        perm_folds.resize(n_perms);
+        Index fold_size = train_data.n_samples() / n_perms;
+        for (Index i = 0; i < train_data.n_samples(); ++i) {
+            uint8_t fold = std::min(static_cast<uint8_t>(i / fold_size), static_cast<uint8_t>(n_perms - 1));
+            perm_folds[fold].push_back(shuffled[i]);
+        }
+
+        // Separate predictions for each permutation
+        perm_preds.resize(n_perms);
+        for (uint8_t p = 0; p < n_perms; ++p) {
+            perm_preds[p].resize(train_data.n_samples(), base_prediction_);
+        }
+
+        if (config_.verbosity > 0) {
+            std::printf("[DEBUG] Ordered Boosting: %u permutation folds\n", n_perms);
+            std::fflush(stdout);
+        }
+    }
+
     // Main training loop
     for (uint32_t iter = 0; iter < config_.boosting.n_estimators; ++iter) {
         auto iter_start = std::chrono::high_resolution_clock::now();
+
+        // Ordered Boosting: use out-of-fold predictions for gradients
+        if (config_.boosting.use_ordered_boosting) {
+            // For each sample, use prediction from fold that DIDN'T train on it
+            uint8_t current_perm = iter % n_perms;
+            #pragma omp parallel for
+            for (Index i = 0; i < train_data.n_samples(); ++i) {
+                train_preds[i] = perm_preds[current_perm][i];
+            }
+        }
 
         // Update gradients
         update_gradients(train_data, train_preds);
@@ -138,15 +179,15 @@ void Booster::train(
                        grad_sum, hess_sum, grad_min, grad_max);
             std::fflush(stdout);
         }
-        
+
         // Quantize gradients if configured
         if (config_.tree.use_quantized_grad) {
             train_data.quantize_gradients();
         }
-        
+
         // Sample selection
         std::vector<Index> sample_indices;
-        
+
         if (config_.boosting.use_goss) {
             sample_indices = goss_sample(
                 train_data,
@@ -160,7 +201,7 @@ void Booster::train(
         } else {
             sample_indices = all_indices;
         }
-        
+
         // Feature selection
         std::vector<FeatureIndex> feature_indices;
         if (config_.boosting.colsample_bytree < 1.0f) {
@@ -170,9 +211,26 @@ void Booster::train(
         } else {
             feature_indices = all_features;
         }
-        
+
         // Build tree
         build_tree(train_data, sample_indices, feature_indices, train_preds);
+
+        // Ordered Boosting: update only OOF predictions
+        if (config_.boosting.use_ordered_boosting && ensemble_.n_trees() > 0) {
+            uint8_t train_fold = iter % n_perms;
+            const Float lr = config_.boosting.learning_rate;
+
+            // This tree was trained on train_fold, so update predictions for OTHER folds
+            for (uint8_t p = 0; p < n_perms; ++p) {
+                if (p != train_fold) {
+                    #pragma omp parallel for
+                    for (Index i = 0; i < train_data.n_samples(); ++i) {
+                        Float tree_pred = ensemble_.tree(ensemble_.n_trees() - 1).predict(train_data, i);
+                        perm_preds[p][i] += lr * tree_pred;
+                    }
+                }
+            }
+        }
         
         // Compute training loss
         Float train_loss = compute_loss(train_data, train_preds);
@@ -321,11 +379,13 @@ void Booster::build_tree(
             debug_tree_count++;
         }
 
-        // Update predictions
+        // Update predictions using batch method (faster than per-sample)
+        std::vector<Float> tree_preds(data.n_samples());
+        tree->predict_batch(data, tree_preds.data());
+
         #pragma omp parallel for
         for (Index i = 0; i < data.n_samples(); ++i) {
-            Float tree_pred = tree->predict(data, i);
-            predictions[i] += lr * tree_pred;
+            predictions[i] += lr * tree_preds[i];
         }
 
         ensemble_.add_tree(std::move(tree), lr);
@@ -375,6 +435,11 @@ std::vector<Index> Booster::goss_sample(
 // ============================================================================
 // Initialization
 // ============================================================================
+
+void Booster::init_loss() {
+    // Create loss function based on config (used when loading from file)
+    loss_ = Loss::create(config_.loss, config_.task, config_.n_classes);
+}
 
 void Booster::initialize_training(Dataset& data) {
     // Create loss function
@@ -427,6 +492,7 @@ void Booster::predict_raw(const Dataset& data, Float* output, int n_trees) const
     if (config_.tree.use_symmetric) {
         symmetric_ensemble_.predict_batch(data, output);
     } else {
+        // Use batched prediction with local caching
         ensemble_.predict_batch_optimized(data, output, config_.device.n_threads);
     }
 
@@ -610,18 +676,37 @@ void Booster::save_binary(std::ostream& out) const {
     // Write magic number and version
     const char magic[] = "TCAT";
     out.write(magic, 4);
-    
-    uint32_t version = 1;
+
+    uint32_t version = 2;  // Version 2 with full tree serialization
     out.write(reinterpret_cast<const char*>(&version), sizeof(version));
-    
+
     // Write base prediction
     out.write(reinterpret_cast<const char*>(&base_prediction_), sizeof(base_prediction_));
-    
+
+    // Write task type and n_classes
+    uint8_t task_type = static_cast<uint8_t>(config_.task);
+    out.write(reinterpret_cast<const char*>(&task_type), sizeof(task_type));
+    out.write(reinterpret_cast<const char*>(&config_.n_classes), sizeof(config_.n_classes));
+
+    // Write essential config
+    out.write(reinterpret_cast<const char*>(&config_.boosting.learning_rate), sizeof(config_.boosting.learning_rate));
+    out.write(reinterpret_cast<const char*>(&config_.tree.max_depth), sizeof(config_.tree.max_depth));
+    out.write(reinterpret_cast<const char*>(&config_.tree.lambda_l2), sizeof(config_.tree.lambda_l2));
+
     // Write number of trees
     size_t n_trees = ensemble_.n_trees();
     out.write(reinterpret_cast<const char*>(&n_trees), sizeof(n_trees));
-    
-    // Trees would be serialized here...
+
+    // Write tree weights
+    for (size_t i = 0; i < n_trees; ++i) {
+        Float weight = ensemble_.tree_weight(i);
+        out.write(reinterpret_cast<const char*>(&weight), sizeof(weight));
+    }
+
+    // Write each tree
+    for (size_t i = 0; i < n_trees; ++i) {
+        ensemble_.tree(i).save(out);
+    }
 }
 
 Booster Booster::load_binary(std::istream& in) {
@@ -631,15 +716,57 @@ Booster Booster::load_binary(std::istream& in) {
     if (std::strncmp(magic, "TCAT", 4) != 0) {
         throw std::runtime_error("Invalid TurboCat model file");
     }
-    
+
     uint32_t version;
     in.read(reinterpret_cast<char*>(&version), sizeof(version));
-    
+
+    if (version < 1 || version > 2) {
+        throw std::runtime_error("Unsupported TurboCat model version: " + std::to_string(version));
+    }
+
     Booster booster;
     in.read(reinterpret_cast<char*>(&booster.base_prediction_), sizeof(booster.base_prediction_));
-    
-    // Read trees...
-    
+
+    if (version >= 2) {
+        // Read task type and n_classes
+        uint8_t task_type;
+        in.read(reinterpret_cast<char*>(&task_type), sizeof(task_type));
+        booster.config_.task = static_cast<TaskType>(task_type);
+        in.read(reinterpret_cast<char*>(&booster.config_.n_classes), sizeof(booster.config_.n_classes));
+
+        // Read essential config
+        in.read(reinterpret_cast<char*>(&booster.config_.boosting.learning_rate),
+               sizeof(booster.config_.boosting.learning_rate));
+        in.read(reinterpret_cast<char*>(&booster.config_.tree.max_depth),
+               sizeof(booster.config_.tree.max_depth));
+        in.read(reinterpret_cast<char*>(&booster.config_.tree.lambda_l2),
+               sizeof(booster.config_.tree.lambda_l2));
+    }
+
+    // Read number of trees
+    size_t n_trees;
+    in.read(reinterpret_cast<char*>(&n_trees), sizeof(n_trees));
+
+    if (version >= 2) {
+        // Read tree weights and trees
+        std::vector<Float> weights(n_trees);
+        for (size_t i = 0; i < n_trees; ++i) {
+            in.read(reinterpret_cast<char*>(&weights[i]), sizeof(Float));
+        }
+
+        // Set n_classes for ensemble
+        booster.ensemble_.set_n_classes(booster.config_.n_classes);
+
+        // Read each tree
+        for (size_t i = 0; i < n_trees; ++i) {
+            auto tree = std::make_unique<Tree>(Tree::load(in));
+            booster.ensemble_.add_tree(std::move(tree), weights[i]);
+        }
+    }
+
+    // Initialize loss function
+    booster.init_loss();
+
     return booster;
 }
 
@@ -821,12 +948,14 @@ void Booster::train_multiclass(
             auto tree = std::make_unique<Tree>(config_.tree);
             tree->build(train_data, sample_indices, *hist_builder_);
 
-            // Update predictions for class k
+            // Update predictions for class k using batch method (faster)
             Float lr = config_.boosting.learning_rate;
+            std::vector<Float> tree_preds_batch(n_train);
+            tree->predict_batch(train_data, tree_preds_batch.data());
+
             #pragma omp parallel for
             for (Index i = 0; i < n_train; ++i) {
-                Float tree_pred = tree->predict(train_data, i);
-                train_preds[i * n_classes + k] += lr * tree_pred;
+                train_preds[i * n_classes + k] += lr * tree_preds_batch[i];
             }
 
             // Store tree with class index

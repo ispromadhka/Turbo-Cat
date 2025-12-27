@@ -6,6 +6,7 @@
  */
 
 #include "turbocat/symmetric_tree.hpp"
+#include "turbocat/fast_ensemble.hpp"
 #include <algorithm>
 #include <numeric>
 #include <cstring>
@@ -149,25 +150,20 @@ SymmetricSplit SymmetricTree::find_best_level_split(
 
     uint32_t n_nodes = static_cast<uint32_t>(node_samples.size());
 
-    // Use merged histogram for speed - CatBoost style
-    // Build histogram for ALL samples at this level
-    std::vector<Index> all_samples;
-    GradientPair total_stats;
+    // CORRECT APPROACH: Build histogram for EACH node, sum gains across nodes
+    // This is how CatBoost actually does it for oblivious trees
 
+    // Build per-node histograms
+    std::vector<Histogram> node_histograms(n_nodes, Histogram(n_features, max_bins));
+
+    #pragma omp parallel for schedule(dynamic)
     for (uint32_t n = 0; n < n_nodes; ++n) {
-        all_samples.insert(all_samples.end(),
-                          node_samples[n].begin(),
-                          node_samples[n].end());
-        total_stats += node_stats[n];
+        if (!node_samples[n].empty()) {
+            hist_builder.build(dataset, node_samples[n], {}, node_histograms[n]);
+        }
     }
 
-    // Build merged histogram
-    Histogram merged_hist(n_features, max_bins);
-    hist_builder.build(dataset, all_samples, {}, merged_hist);
-
-    // Find best split using merged histogram
-    // For symmetric trees, the merged gain approximates the sum of individual gains
-    // This is fast and works well in practice (like CatBoost)
+    // Find best split by summing gains across all nodes
     SymmetricSplit best_split;
     best_split.gain = -1e30f;
 
@@ -177,38 +173,49 @@ SymmetricSplit SymmetricTree::find_best_level_split(
         SymmetricSplit local_best;
         local_best.gain = -1e30f;
 
-        #pragma omp for nowait
-        for (FeatureIndex f = 0; f < n_features; ++f) {
-            const GradientPair* hist_bins = merged_hist.bins(f);
+        // Pre-allocate per-thread vector to avoid repeated allocations
+        std::vector<GradientPair> node_left_sums(n_nodes);
 
-            // Cumulative sum for split evaluation
-            GradientPair left_sum;
+        #pragma omp for nowait schedule(static)
+        for (FeatureIndex f = 0; f < n_features; ++f) {
+            // Reset cumulative sums for this feature (faster than reallocating)
+            std::memset(node_left_sums.data(), 0, n_nodes * sizeof(GradientPair));
 
             for (BinIndex b = 0; b < max_bins - 1; ++b) {
-                left_sum += hist_bins[b];
-                GradientPair right_sum = total_stats - left_sum;
+                // Update cumulative sums for each node
+                Float total_gain = 0.0f;
+                bool valid_split = true;
 
-                // Check constraints (relaxed for symmetric trees)
-                if (left_sum.count < config_.min_samples_leaf ||
-                    right_sum.count < config_.min_samples_leaf) {
-                    continue;
+                for (uint32_t n = 0; n < n_nodes; ++n) {
+                    node_left_sums[n] += node_histograms[n].bins(f)[b];
+                    GradientPair left_sum = node_left_sums[n];
+                    GradientPair right_sum = node_stats[n] - left_sum;
+
+                    // Skip if this node has no samples
+                    if (node_stats[n].count == 0) {
+                        continue;
+                    }
+
+                    // Check constraints per node
+                    if (left_sum.hess < 1e-10f || right_sum.hess < 1e-10f) {
+                        // This split creates empty children for this node
+                        // Still allow the split, just don't add gain for this node
+                        continue;
+                    }
+
+                    // Compute gain for this node
+                    Float left_gain = (left_sum.grad * left_sum.grad) / (left_sum.hess + lambda);
+                    Float right_gain = (right_sum.grad * right_sum.grad) / (right_sum.hess + lambda);
+                    Float parent_gain = (node_stats[n].grad * node_stats[n].grad) / (node_stats[n].hess + lambda);
+
+                    Float node_gain = 0.5f * (left_gain + right_gain - parent_gain);
+                    total_gain += node_gain;
                 }
 
-                if (left_sum.hess < 1e-10f || right_sum.hess < 1e-10f) {
-                    continue;
-                }
-
-                // Compute gain on merged data
-                Float left_gain = (left_sum.grad * left_sum.grad) / (left_sum.hess + lambda);
-                Float right_gain = (right_sum.grad * right_sum.grad) / (right_sum.hess + lambda);
-                Float parent_gain = (total_stats.grad * total_stats.grad) / (total_stats.hess + lambda);
-
-                Float gain = 0.5f * (left_gain + right_gain - parent_gain);
-
-                if (gain > local_best.gain) {
+                if (total_gain > local_best.gain) {
                     local_best.feature = f;
                     local_best.threshold = b;
-                    local_best.gain = gain;
+                    local_best.gain = total_gain;
                 }
             }
         }
@@ -327,6 +334,13 @@ std::vector<Float> SymmetricTree::feature_importance() const {
 // Symmetric Ensemble Implementation
 // ============================================================================
 
+// Constructors, destructor, and move operations must be defined here where FastEnsemble is complete
+SymmetricEnsemble::SymmetricEnsemble() = default;
+SymmetricEnsemble::SymmetricEnsemble(uint32_t n_classes) : n_classes_(n_classes) {}
+SymmetricEnsemble::~SymmetricEnsemble() = default;
+SymmetricEnsemble::SymmetricEnsemble(SymmetricEnsemble&&) noexcept = default;
+SymmetricEnsemble& SymmetricEnsemble::operator=(SymmetricEnsemble&&) noexcept = default;
+
 void SymmetricEnsemble::add_tree(std::unique_ptr<SymmetricTree> tree, Float weight) {
     trees_.push_back(std::move(tree));
     tree_weights_.push_back(weight);
@@ -351,6 +365,22 @@ Float SymmetricEnsemble::predict(const Dataset& data, Index row) const {
 
 void SymmetricEnsemble::predict_batch(const Dataset& data, Float* output) const {
     Index n_samples = data.n_samples();
+
+    // Use FastEnsemble for SIMD-optimized prediction on large batches
+    if (n_samples >= 16 && trees_.size() > 0) {
+        prepare_fast_ensemble();
+
+        if (fast_ensemble_ && !fast_ensemble_->empty()) {
+            // Use column-major data directly (no transpose needed!)
+            // This is much faster as we can load 8 consecutive bytes at once
+            const BinIndex* col_data = data.binned().column(0);
+
+            fast_ensemble_->predict_batch_column_major(col_data, n_samples, data.n_features(), output);
+            return;
+        }
+    }
+
+    // Fallback to original implementation
     std::memset(output, 0, n_samples * sizeof(Float));
 
     for (size_t t = 0; t < trees_.size(); ++t) {
@@ -361,6 +391,14 @@ void SymmetricEnsemble::predict_batch(const Dataset& data, Float* output) const 
             output[i] += weight * trees_[t]->predict(data, i);
         }
     }
+}
+
+void SymmetricEnsemble::prepare_fast_ensemble() const {
+    if (fast_prepared_) return;
+
+    fast_ensemble_ = std::make_unique<FastEnsemble>();
+    fast_ensemble_->from_symmetric_ensemble(*this);
+    fast_prepared_ = true;
 }
 
 void SymmetricEnsemble::predict_multiclass(const Dataset& data, Index row, Float* output) const {

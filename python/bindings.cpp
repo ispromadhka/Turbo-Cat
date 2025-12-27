@@ -35,7 +35,7 @@ class TurboCatClassifier {
 public:
     TurboCatClassifier(
         int n_estimators = 1000,
-        float learning_rate = 0.05f,
+        float learning_rate = 0.1f,
         int max_depth = 6,
         int max_bins = 255,
         float subsample = 0.8f,
@@ -43,16 +43,19 @@ public:
         float min_child_weight = 1.0f,
         float lambda_l2 = 1.0f,
         const std::string& loss = "auto",
-        bool use_goss = true,
+        bool use_goss = false,
         float goss_top_rate = 0.2f,
         float goss_other_rate = 0.1f,
         bool use_gradtree = false,
         bool use_symmetric = false,  // Oblivious trees (experimental)
+        bool use_ordered_boosting = false,  // Ordered boosting (like CatBoost)
+        const std::string& grow_policy = "depthwise",  // "depthwise" or "lossguide"
+        const std::string& mode = "auto",  // "small", "large", or "auto"
         int early_stopping_rounds = 50,
         int n_threads = -1,
         int seed = 42,
         int verbosity = 1
-    ) : loss_type_str_(loss) {
+    ) : loss_type_str_(loss), mode_(mode) {
         // Will configure properly in fit() when we know n_classes
         config_.boosting.n_estimators = n_estimators;
         config_.boosting.learning_rate = learning_rate;
@@ -67,10 +70,29 @@ public:
         config_.boosting.goss_other_rate = goss_other_rate;
         config_.tree.use_gradtree = use_gradtree;
         config_.tree.use_symmetric = use_symmetric;
+        config_.boosting.use_ordered_boosting = use_ordered_boosting;
         config_.boosting.early_stopping_rounds = early_stopping_rounds;
         config_.device.n_threads = n_threads;
         config_.seed = seed;
         config_.verbosity = verbosity;
+
+        // Parse grow_policy
+        if (grow_policy == "lossguide" || grow_policy == "leaf" || grow_policy == "leafwise") {
+            config_.tree.grow_policy = GrowPolicy::Lossguide;
+        } else {
+            config_.tree.grow_policy = GrowPolicy::Depthwise;
+        }
+
+        // Parse mode - controls tree architecture based on data size
+        // "small" = regular trees (best quality, fast training)
+        // "large" = symmetric trees with bit-ops (fastest inference on large data)
+        // "auto" = automatically select based on dataset size in fit()
+        if (mode == "large") {
+            config_.tree.use_symmetric = true;  // Use symmetric trees for large data
+        } else if (mode == "small") {
+            config_.tree.use_symmetric = false;  // Use regular trees for small data
+        }
+        // "auto" mode will be handled in fit() based on data size
     }
 
     void fit(
@@ -92,6 +114,18 @@ public:
 
         Index n_samples = static_cast<Index>(X_buf.shape[0]);
         FeatureIndex n_features = static_cast<FeatureIndex>(X_buf.shape[1]);
+
+        // Handle "auto" mode - choose tree type based on dataset size
+        // "small" data: regular trees (best quality, faster training)
+        // "large" data: symmetric trees (faster inference with bit-ops)
+        if (mode_ == "auto") {
+            // Thresholds for switching to symmetric trees:
+            // - 50K+ samples: symmetric trees for faster inference
+            // - 20K+ samples with 50+ features: symmetric for cache efficiency
+            bool is_large = (n_samples >= 50000) ||
+                           (n_samples >= 20000 && n_features >= 50);
+            config_.tree.use_symmetric = is_large;
+        }
 
         // Detect number of classes from labels
         float* y_ptr = static_cast<float*>(y_buf.ptr);
@@ -264,10 +298,64 @@ public:
         }
         booster_->save(path);
     }
-    
+
     void load(const std::string& path) {
         booster_ = std::make_unique<Booster>(Booster::load(path));
         is_fitted_ = true;
+    }
+
+    // Get tree structure for ONNX export
+    py::list get_booster_dump() const {
+        if (!is_fitted_) {
+            throw std::runtime_error("Model not fitted");
+        }
+
+        py::list trees_list;
+        const auto& ensemble = booster_->ensemble();
+        size_t n_trees = ensemble.n_trees();
+
+        for (size_t t = 0; t < n_trees; ++t) {
+            const auto& tree = ensemble.tree(t);
+            const auto& nodes = tree.nodes();
+            Float weight = ensemble.tree_weight(t);
+
+            py::dict tree_dict;
+            tree_dict["weight"] = weight;
+            tree_dict["n_nodes"] = nodes.size();
+            tree_dict["depth"] = tree.depth();
+
+            py::list nodes_list;
+            for (size_t i = 0; i < nodes.size(); ++i) {
+                const auto& node = nodes[i];
+                py::dict node_dict;
+                node_dict["is_leaf"] = static_cast<bool>(node.is_leaf);
+                node_dict["feature"] = static_cast<int>(node.split_feature);
+                node_dict["threshold"] = static_cast<int>(node.split_bin);
+                node_dict["left_child"] = static_cast<int>(node.left_child);
+                node_dict["right_child"] = static_cast<int>(node.right_child);
+                node_dict["value"] = node.value;
+                node_dict["default_left"] = static_cast<bool>(node.default_left);
+                nodes_list.append(node_dict);
+            }
+            tree_dict["nodes"] = nodes_list;
+            trees_list.append(tree_dict);
+        }
+
+        return trees_list;
+    }
+
+    Float get_base_prediction() const {
+        if (!is_fitted_) {
+            throw std::runtime_error("Model not fitted");
+        }
+        return booster_->base_prediction();
+    }
+
+    FeatureIndex get_n_features() const {
+        if (!train_data_) {
+            throw std::runtime_error("Model not fitted");
+        }
+        return train_data_->n_features();
     }
     
     size_t n_trees() const {
@@ -296,6 +384,7 @@ private:
     std::unique_ptr<Booster> booster_;
     std::unique_ptr<Dataset> train_data_;
     std::string loss_type_str_;
+    std::string mode_;
     uint32_t n_classes_ = 2;
     bool is_fitted_ = false;
 };
@@ -308,15 +397,17 @@ class TurboCatRegressor {
 public:
     TurboCatRegressor(
         int n_estimators = 1000,
-        float learning_rate = 0.05f,
+        float learning_rate = 0.1f,
         int max_depth = 6,
         const std::string& loss = "mse",
         float subsample = 0.8f,
         float colsample_bytree = 0.8f,
-        bool use_goss = true,
+        bool use_goss = false,
         float goss_top_rate = 0.2f,
         float goss_other_rate = 0.1f,
         int early_stopping_rounds = 50,
+        float lambda_l2 = 0.0f,
+        const std::string& grow_policy = "depthwise",  // "depthwise" or "lossguide"
         int n_threads = -1,
         int seed = 42,
         int verbosity = 1
@@ -332,9 +423,17 @@ public:
         config_.boosting.goss_top_rate = goss_top_rate;
         config_.boosting.goss_other_rate = goss_other_rate;
         config_.boosting.early_stopping_rounds = early_stopping_rounds;
+        config_.tree.lambda_l2 = lambda_l2;
         config_.device.n_threads = n_threads;
         config_.seed = seed;
         config_.verbosity = verbosity;
+
+        // Parse grow_policy
+        if (grow_policy == "lossguide" || grow_policy == "leaf" || grow_policy == "leafwise") {
+            config_.tree.grow_policy = GrowPolicy::Lossguide;
+        } else {
+            config_.tree.grow_policy = GrowPolicy::Depthwise;
+        }
 
         if (loss == "mse" || loss == "l2") {
             config_.loss.loss_type = LossType::MSE;
@@ -400,27 +499,16 @@ public:
         );
         test_data.apply_bins(*train_data_);
 
-        // Manual prediction - return std::vector to avoid py::array_t GCC issues
+        // Use batched prediction with local caching
         const auto& ensemble = booster_->ensemble();
         std::vector<float> predictions(n_samples, 0.0f);
 
-        for (Index row = 0; row < n_samples; ++row) {
-            float sum = 0.0f;
-            for (size_t t = 0; t < ensemble.n_trees(); ++t) {
-                const auto& tree = ensemble.tree(t);
-                const auto& nodes = tree.nodes();
-                if (nodes.empty()) continue;
+        ensemble.predict_batch_optimized(test_data, predictions.data(), config_.device.n_threads);
 
-                float weight = ensemble.tree_weight(t);
-                TreeIndex node_idx = 0;
-                while (!nodes[node_idx].is_leaf) {
-                    const TreeNode& node = nodes[node_idx];
-                    BinIndex bin = test_data.binned().get(row, node.split_feature);
-                    node_idx = (bin > node.split_bin) ? node.right_child : node.left_child;
-                }
-                sum += weight * nodes[node_idx].value;
-            }
-            predictions[row] = sum + booster_->base_prediction();
+        // Add base prediction
+        float base = booster_->base_prediction();
+        for (Index i = 0; i < n_samples; ++i) {
+            predictions[i] += base;
         }
 
         return predictions;
@@ -633,6 +721,65 @@ public:
         return result;
     }
 
+    void save(const std::string& path) {
+        if (!is_fitted_) {
+            throw std::runtime_error("Model not fitted");
+        }
+        booster_->save(path);
+    }
+
+    void load(const std::string& path) {
+        booster_ = std::make_unique<Booster>(Booster::load(path));
+        is_fitted_ = true;
+    }
+
+    // Get tree structure for ONNX export
+    py::list get_booster_dump() const {
+        if (!is_fitted_) {
+            throw std::runtime_error("Model not fitted");
+        }
+
+        py::list trees_list;
+        const auto& ensemble = booster_->ensemble();
+        size_t n_trees_count = ensemble.n_trees();
+
+        for (size_t t = 0; t < n_trees_count; ++t) {
+            const auto& tree = ensemble.tree(t);
+            const auto& nodes = tree.nodes();
+            Float weight = ensemble.tree_weight(t);
+
+            py::dict tree_dict;
+            tree_dict["weight"] = weight;
+            tree_dict["n_nodes"] = nodes.size();
+            tree_dict["depth"] = tree.depth();
+
+            py::list nodes_list;
+            for (size_t i = 0; i < nodes.size(); ++i) {
+                const auto& node = nodes[i];
+                py::dict node_dict;
+                node_dict["is_leaf"] = static_cast<bool>(node.is_leaf);
+                node_dict["feature"] = static_cast<int>(node.split_feature);
+                node_dict["threshold"] = static_cast<int>(node.split_bin);
+                node_dict["left_child"] = static_cast<int>(node.left_child);
+                node_dict["right_child"] = static_cast<int>(node.right_child);
+                node_dict["value"] = node.value;
+                node_dict["default_left"] = static_cast<bool>(node.default_left);
+                nodes_list.append(node_dict);
+            }
+            tree_dict["nodes"] = nodes_list;
+            trees_list.append(tree_dict);
+        }
+
+        return trees_list;
+    }
+
+    FeatureIndex get_n_features() const {
+        if (!train_data_) {
+            throw std::runtime_error("Model not fitted");
+        }
+        return train_data_->n_features();
+    }
+
 private:
     Config config_;
     std::unique_ptr<Booster> booster_;
@@ -653,9 +800,10 @@ PYBIND11_MODULE(_turbocat, m) {
     // Classifier
     py::class_<TurboCatClassifier>(m, "TurboCatClassifier")
         .def(py::init<int, float, int, int, float, float, float, float,
-                      const std::string&, bool, float, float, bool, bool, int, int, int, int>(),
+                      const std::string&, bool, float, float, bool, bool, bool,
+                      const std::string&, const std::string&, int, int, int, int>(),
              py::arg("n_estimators") = 1000,
-             py::arg("learning_rate") = 0.05f,
+             py::arg("learning_rate") = 0.1f,
              py::arg("max_depth") = 6,
              py::arg("max_bins") = 255,
              py::arg("subsample") = 0.8f,
@@ -663,11 +811,14 @@ PYBIND11_MODULE(_turbocat, m) {
              py::arg("min_child_weight") = 1.0f,
              py::arg("lambda_l2") = 1.0f,
              py::arg("loss") = "logloss",
-             py::arg("use_goss") = true,
+             py::arg("use_goss") = false,
              py::arg("goss_top_rate") = 0.2f,
              py::arg("goss_other_rate") = 0.1f,
              py::arg("use_gradtree") = false,
              py::arg("use_symmetric") = false,
+             py::arg("use_ordered_boosting") = false,
+             py::arg("grow_policy") = "depthwise",
+             py::arg("mode") = "auto",  // "small", "large", or "auto"
              py::arg("early_stopping_rounds") = 50,
              py::arg("n_threads") = -1,
              py::arg("seed") = 42,
@@ -685,22 +836,28 @@ PYBIND11_MODULE(_turbocat, m) {
         .def("save", &TurboCatClassifier::save)
         .def("load", &TurboCatClassifier::load)
         .def("get_params", &TurboCatClassifier::get_params)
+        .def("get_booster_dump", &TurboCatClassifier::get_booster_dump)
+        .def("get_base_prediction", &TurboCatClassifier::get_base_prediction)
+        .def("get_n_features", &TurboCatClassifier::get_n_features)
         .def_property_readonly("n_trees", &TurboCatClassifier::n_trees)
         .def_property_readonly("n_classes_", &TurboCatClassifier::n_classes);
     
     // Regressor
     py::class_<TurboCatRegressor>(m, "TurboCatRegressor")
-        .def(py::init<int, float, int, const std::string&, float, float, bool, float, float, int, int, int, int>(),
+        .def(py::init<int, float, int, const std::string&, float, float, bool, float, float, int, float,
+                      const std::string&, int, int, int>(),
              py::arg("n_estimators") = 1000,
-             py::arg("learning_rate") = 0.05f,
+             py::arg("learning_rate") = 0.1f,
              py::arg("max_depth") = 6,
              py::arg("loss") = "mse",
              py::arg("subsample") = 0.8f,
              py::arg("colsample_bytree") = 0.8f,
-             py::arg("use_goss") = true,
+             py::arg("use_goss") = false,
              py::arg("goss_top_rate") = 0.2f,
              py::arg("goss_other_rate") = 0.1f,
              py::arg("early_stopping_rounds") = 50,
+             py::arg("lambda_l2") = 0.0f,
+             py::arg("grow_policy") = "depthwise",
              py::arg("n_threads") = -1,
              py::arg("seed") = 42,
              py::arg("verbosity") = 1)
@@ -709,6 +866,10 @@ PYBIND11_MODULE(_turbocat, m) {
         .def("debug_info", &TurboCatRegressor::debug_info)
         .def("tree_info", &TurboCatRegressor::tree_info)
         .def("debug_predict", &TurboCatRegressor::debug_predict)
+        .def("save", &TurboCatRegressor::save)
+        .def("load", &TurboCatRegressor::load)
+        .def("get_booster_dump", &TurboCatRegressor::get_booster_dump)
+        .def("get_n_features", &TurboCatRegressor::get_n_features)
         .def_property_readonly("n_trees", &TurboCatRegressor::n_trees)
         .def_property_readonly("base_prediction", &TurboCatRegressor::base_prediction);
 

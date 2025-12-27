@@ -3,6 +3,7 @@
  */
 
 #include "turbocat/tree.hpp"
+#include "turbocat/flat_tree.hpp"
 #include <algorithm>
 #include <queue>
 #include <stack>
@@ -38,37 +39,52 @@ void Tree::build(
     nodes_.clear();
     n_leaves_ = 0;
     depth_ = 0;
-    
+
     if (sample_indices.empty()) {
         return;
     }
-    
+
+    // Choose growth strategy based on config
+    if (config_.grow_policy == GrowPolicy::Lossguide) {
+        build_leafwise(dataset, sample_indices, hist_builder);
+        return;
+    }
+
+    // Default: Depthwise (level-wise) growth
     // Add root node
     TreeIndex root = add_node();
-    
+
     // Compute total gradient/hessian
     GradientPair root_stats;
     const Float* grads = dataset.gradients();
     const Float* hess = dataset.hessians();
-    
+
     for (Index idx : sample_indices) {
         root_stats.grad += grads[idx];
         root_stats.hess += hess[idx];
         root_stats.count += 1;
     }
-    
+
     nodes_[root].stats = root_stats;
-    
+
     // All features for root
     std::vector<FeatureIndex> all_features(dataset.n_features());
     std::iota(all_features.begin(), all_features.end(), static_cast<FeatureIndex>(0));
-    
-    // Histogram for building
-    Histogram histogram(dataset.n_features(), config_.max_bins);
-    
-    // Build recursively
-    build_recursive(root, dataset, sample_indices, all_features, 
-                   hist_builder, histogram, 0);
+
+    // Pre-allocate histogram pool to avoid allocations during recursion
+    // We need max_depth + 1 histograms for the stack
+    std::vector<Histogram> hist_pool;
+    hist_pool.reserve(config_.max_depth + 2);
+    for (int i = 0; i < config_.max_depth + 2; ++i) {
+        hist_pool.emplace_back(dataset.n_features(), config_.max_bins);
+    }
+
+    // Build root histogram
+    hist_builder.build(dataset, sample_indices, all_features, hist_pool[0]);
+
+    // Build recursively with histogram subtraction trick
+    build_recursive_optimized(root, dataset, sample_indices, all_features,
+                              hist_builder, hist_pool, 0, 0);
 }
 
 void Tree::build_recursive(
@@ -82,10 +98,8 @@ void Tree::build_recursive(
 ) {
     depth_ = std::max(depth_, current_depth);
 
-    // Read node stats (don't keep reference - can be invalidated)
     GradientPair node_stats = nodes_[node_idx].stats;
 
-    // Check stopping conditions
     bool should_stop =
         current_depth >= config_.max_depth ||
         n_leaves_ >= config_.max_leaves ||
@@ -97,10 +111,8 @@ void Tree::build_recursive(
         return;
     }
 
-    // Build histogram for this node
     hist_builder.build(dataset, indices, features, histogram);
 
-    // Find best split (reuse finder to avoid allocation)
     SplitFinder finder(config_);
     SplitInfo best_split = finder.find_best_split(histogram, node_stats, features);
 
@@ -109,13 +121,11 @@ void Tree::build_recursive(
         return;
     }
 
-    // Apply split - use direct indexing
     nodes_[node_idx].split_feature = best_split.feature_idx;
     nodes_[node_idx].split_bin = best_split.bin_threshold;
     nodes_[node_idx].is_leaf = 0;
     nodes_[node_idx].gain = best_split.gain;
 
-    // Partition samples - optimized single-pass
     std::vector<Index> left_indices, right_indices;
     left_indices.reserve(indices.size() / 2);
     right_indices.reserve(indices.size() / 2);
@@ -126,13 +136,9 @@ void Tree::build_recursive(
 
     for (Index idx : indices) {
         BinIndex bin = feature_bins[idx];
-
-        if (bin == 255) {  // NaN bin
-            if (default_left) {
-                left_indices.push_back(idx);
-            } else {
-                right_indices.push_back(idx);
-            }
+        if (bin == 255) {
+            if (default_left) left_indices.push_back(idx);
+            else right_indices.push_back(idx);
         } else if (bin <= threshold) {
             left_indices.push_back(idx);
         } else {
@@ -140,13 +146,11 @@ void Tree::build_recursive(
         }
     }
 
-    // Learn missing value direction
     if (config_.learn_missing_direction &&
         (left_indices.size() != indices.size() && right_indices.size() != indices.size())) {
         nodes_[node_idx].default_left = left_indices.size() >= right_indices.size() ? 1 : 0;
     }
 
-    // Create child nodes
     TreeIndex left_child = add_node();
     TreeIndex right_child = add_node();
 
@@ -155,14 +159,121 @@ void Tree::build_recursive(
     nodes_[left_child].stats = best_split.left_stats;
     nodes_[right_child].stats = best_split.right_stats;
 
-    // Simple recursive build without extra allocations
-    // The histogram subtraction trick saves ~50% of histogram build time,
-    // but the allocation overhead can negate the benefit.
-    // We use a simpler approach: just build both children.
     build_recursive(left_child, dataset, left_indices, features,
                    hist_builder, histogram, current_depth + 1);
     build_recursive(right_child, dataset, right_indices, features,
                    hist_builder, histogram, current_depth + 1);
+}
+
+// Optimized build with histogram subtraction trick
+void Tree::build_recursive_optimized(
+    TreeIndex node_idx,
+    const Dataset& dataset,
+    const std::vector<Index>& indices,
+    const std::vector<FeatureIndex>& features,
+    HistogramBuilder& hist_builder,
+    std::vector<Histogram>& hist_pool,
+    int hist_idx,
+    uint16_t current_depth
+) {
+    depth_ = std::max(depth_, current_depth);
+
+    GradientPair node_stats = nodes_[node_idx].stats;
+
+    bool should_stop =
+        current_depth >= config_.max_depth ||
+        n_leaves_ >= config_.max_leaves ||
+        indices.size() < static_cast<size_t>(2 * config_.min_samples_leaf) ||
+        node_stats.hess < 2 * config_.min_child_weight;
+
+    if (should_stop) {
+        make_leaf(node_idx, node_stats);
+        return;
+    }
+
+    // Current histogram is already built (passed from parent or root)
+    Histogram& parent_hist = hist_pool[hist_idx];
+
+    SplitFinder finder(config_);
+    SplitInfo best_split = finder.find_best_split(parent_hist, node_stats, features);
+
+    if (!best_split.is_valid || best_split.gain < config_.min_split_gain) {
+        make_leaf(node_idx, node_stats);
+        return;
+    }
+
+    nodes_[node_idx].split_feature = best_split.feature_idx;
+    nodes_[node_idx].split_bin = best_split.bin_threshold;
+    nodes_[node_idx].is_leaf = 0;
+    nodes_[node_idx].gain = best_split.gain;
+
+    std::vector<Index> left_indices, right_indices;
+    left_indices.reserve(indices.size() / 2);
+    right_indices.reserve(indices.size() / 2);
+
+    const BinIndex* feature_bins = dataset.binned().column(best_split.feature_idx);
+    const BinIndex threshold = best_split.bin_threshold;
+    uint8_t default_left = nodes_[node_idx].default_left;
+
+    for (Index idx : indices) {
+        BinIndex bin = feature_bins[idx];
+        if (bin == 255) {
+            if (default_left) left_indices.push_back(idx);
+            else right_indices.push_back(idx);
+        } else if (bin <= threshold) {
+            left_indices.push_back(idx);
+        } else {
+            right_indices.push_back(idx);
+        }
+    }
+
+    if (config_.learn_missing_direction &&
+        left_indices.size() != indices.size() && right_indices.size() != indices.size()) {
+        nodes_[node_idx].default_left = left_indices.size() >= right_indices.size() ? 1 : 0;
+    }
+
+    TreeIndex left_child = add_node();
+    TreeIndex right_child = add_node();
+
+    nodes_[node_idx].left_child = left_child;
+    nodes_[node_idx].right_child = right_child;
+    nodes_[left_child].stats = best_split.left_stats;
+    nodes_[right_child].stats = best_split.right_stats;
+
+    // HISTOGRAM SUBTRACTION TRICK:
+    // Only build histogram for smaller child, compute larger via subtraction
+    bool left_is_smaller = left_indices.size() <= right_indices.size();
+    int child_hist_idx = hist_idx + 1;  // Use next slot in pool
+
+    if (left_is_smaller) {
+        // Build histogram for smaller (left) child
+        hist_builder.build(dataset, left_indices, features, hist_pool[child_hist_idx]);
+
+        // Process left child first (it has the built histogram)
+        build_recursive_optimized(left_child, dataset, left_indices, features,
+                                  hist_builder, hist_pool, child_hist_idx, current_depth + 1);
+
+        // Compute right histogram via subtraction: right = parent - left
+        hist_pool[child_hist_idx].subtract_from(parent_hist, hist_pool[child_hist_idx]);
+
+        // Process right child with subtracted histogram
+        build_recursive_optimized(right_child, dataset, right_indices, features,
+                                  hist_builder, hist_pool, child_hist_idx, current_depth + 1);
+    } else {
+        // Build histogram for smaller (right) child
+        hist_builder.build(dataset, right_indices, features, hist_pool[child_hist_idx]);
+
+        // Process right child first
+        build_recursive_optimized(right_child, dataset, right_indices, features,
+                                  hist_builder, hist_pool, child_hist_idx, current_depth + 1);
+
+        // Compute left histogram via subtraction: left = parent - right
+        hist_pool[child_hist_idx].subtract_from(parent_hist, hist_pool[child_hist_idx]);
+
+        // Process left child with subtracted histogram
+        build_recursive_optimized(left_child, dataset, left_indices, features,
+                                  hist_builder, hist_pool, child_hist_idx, current_depth + 1);
+    }
 }
 
 // Optimized recursive build using pre-computed histogram
@@ -284,17 +395,216 @@ TreeIndex Tree::add_node() {
 void Tree::make_leaf(TreeIndex node_idx, const GradientPair& stats) {
     TreeNode& node = nodes_[node_idx];
     node.is_leaf = 1;
-    
+
     // Compute leaf value: -G / (H + λ)
-    node.value = -stats.grad / (stats.hess + config_.lambda_l2);
-    
+    Float raw_value = -stats.grad / (stats.hess + config_.lambda_l2);
+
+    // Optional smoothing based on sample count (reduces overfitting on small leaves)
+    // shrink = count / (count + smooth_weight)
+    if (config_.leaf_smooth > 0.0f) {
+        Float shrink_factor = static_cast<Float>(stats.count) /
+                             (static_cast<Float>(stats.count) + config_.leaf_smooth);
+        node.value = raw_value * shrink_factor;
+    } else {
+        node.value = raw_value;
+    }
+
     // Apply delta step constraint
     if (config_.max_delta_step > 0) {
-        node.value = std::max(-config_.max_delta_step, 
+        node.value = std::max(-config_.max_delta_step,
                              std::min(config_.max_delta_step, node.value));
     }
-    
+
     n_leaves_++;
+}
+
+// ============================================================================
+// Leaf-wise (Loss-guided) Tree Building
+// ============================================================================
+
+void Tree::build_leafwise(
+    const Dataset& dataset,
+    const std::vector<Index>& sample_indices,
+    HistogramBuilder& hist_builder
+) {
+    // Leaf-wise tree building (LightGBM style):
+    // Instead of growing all nodes at each depth level (depth-wise),
+    // we grow the leaf with the highest potential gain.
+    // This often results in deeper, more accurate trees.
+
+    struct LeafCandidate {
+        TreeIndex node_idx;
+        SplitInfo split;
+        std::vector<Index> indices;
+        uint16_t depth;
+        GradientPair stats;
+
+        bool operator<(const LeafCandidate& other) const {
+            return split.gain < other.split.gain;  // Max-heap
+        }
+    };
+
+    std::priority_queue<LeafCandidate> candidates;
+
+    // All features for splitting
+    std::vector<FeatureIndex> all_features(dataset.n_features());
+    std::iota(all_features.begin(), all_features.end(), static_cast<FeatureIndex>(0));
+
+    // Create root node
+    TreeIndex root = add_node();
+
+    // Compute root statistics
+    GradientPair root_stats;
+    const Float* grads = dataset.gradients();
+    const Float* hess = dataset.hessians();
+
+    for (Index idx : sample_indices) {
+        root_stats.grad += grads[idx];
+        root_stats.hess += hess[idx];
+        root_stats.count += 1;
+    }
+    nodes_[root].stats = root_stats;
+
+    // Build histogram for root
+    Histogram root_hist(dataset.n_features(), config_.max_bins);
+    hist_builder.build(dataset, sample_indices, all_features, root_hist);
+
+    // Find best split for root
+    SplitFinder finder(config_);
+    SplitInfo root_split = finder.find_best_split(root_hist, root_stats, all_features);
+
+    if (root_split.is_valid && root_split.gain >= config_.min_split_gain) {
+        LeafCandidate root_candidate;
+        root_candidate.node_idx = root;
+        root_candidate.split = root_split;
+        root_candidate.indices = sample_indices;
+        root_candidate.depth = 0;
+        root_candidate.stats = root_stats;
+        candidates.push(std::move(root_candidate));
+    } else {
+        // Root becomes a leaf
+        make_leaf(root, root_stats);
+        return;
+    }
+
+    // Grow tree by always splitting the leaf with highest gain
+    while (!candidates.empty() && n_leaves_ < config_.max_leaves) {
+        LeafCandidate best = std::move(const_cast<LeafCandidate&>(candidates.top()));
+        candidates.pop();
+
+        TreeIndex node_idx = best.node_idx;
+        const SplitInfo& split = best.split;
+        uint16_t current_depth = best.depth;
+
+        // Check depth constraint
+        if (current_depth >= config_.max_depth) {
+            make_leaf(node_idx, best.stats);
+            continue;
+        }
+
+        // Apply the split
+        nodes_[node_idx].split_feature = split.feature_idx;
+        nodes_[node_idx].split_bin = split.bin_threshold;
+        nodes_[node_idx].is_leaf = 0;
+        nodes_[node_idx].gain = split.gain;
+
+        // Partition samples
+        std::vector<Index> left_indices, right_indices;
+        left_indices.reserve(best.indices.size() / 2);
+        right_indices.reserve(best.indices.size() / 2);
+
+        const BinIndex* feature_bins = dataset.binned().column(split.feature_idx);
+        const BinIndex threshold = split.bin_threshold;
+        bool default_left = nodes_[node_idx].default_left;
+
+        for (Index idx : best.indices) {
+            BinIndex bin = feature_bins[idx];
+            if (bin == 255) {
+                if (default_left) left_indices.push_back(idx);
+                else right_indices.push_back(idx);
+            } else if (bin <= threshold) {
+                left_indices.push_back(idx);
+            } else {
+                right_indices.push_back(idx);
+            }
+        }
+
+        // Learn missing value direction
+        if (config_.learn_missing_direction &&
+            left_indices.size() != best.indices.size() && right_indices.size() != best.indices.size()) {
+            nodes_[node_idx].default_left = left_indices.size() >= right_indices.size() ? 1 : 0;
+        }
+
+        // Create child nodes
+        TreeIndex left_child = add_node();
+        TreeIndex right_child = add_node();
+
+        nodes_[node_idx].left_child = left_child;
+        nodes_[node_idx].right_child = right_child;
+        nodes_[left_child].stats = split.left_stats;
+        nodes_[right_child].stats = split.right_stats;
+
+        depth_ = std::max(depth_, static_cast<uint16_t>(current_depth + 1));
+
+        // Process left child
+        bool left_can_split =
+            left_indices.size() >= static_cast<size_t>(2 * config_.min_samples_leaf) &&
+            split.left_stats.hess >= 2 * config_.min_child_weight;
+
+        if (left_can_split && n_leaves_ + 1 < config_.max_leaves) {
+            Histogram left_hist(dataset.n_features(), config_.max_bins);
+            hist_builder.build(dataset, left_indices, all_features, left_hist);
+
+            SplitInfo left_split = finder.find_best_split(left_hist, split.left_stats, all_features);
+
+            if (left_split.is_valid && left_split.gain >= config_.min_split_gain) {
+                LeafCandidate left_candidate;
+                left_candidate.node_idx = left_child;
+                left_candidate.split = left_split;
+                left_candidate.indices = std::move(left_indices);
+                left_candidate.depth = current_depth + 1;
+                left_candidate.stats = split.left_stats;
+                candidates.push(std::move(left_candidate));
+            } else {
+                make_leaf(left_child, split.left_stats);
+            }
+        } else {
+            make_leaf(left_child, split.left_stats);
+        }
+
+        // Process right child
+        bool right_can_split =
+            right_indices.size() >= static_cast<size_t>(2 * config_.min_samples_leaf) &&
+            split.right_stats.hess >= 2 * config_.min_child_weight;
+
+        if (right_can_split && n_leaves_ + 1 < config_.max_leaves) {
+            Histogram right_hist(dataset.n_features(), config_.max_bins);
+            hist_builder.build(dataset, right_indices, all_features, right_hist);
+
+            SplitInfo right_split = finder.find_best_split(right_hist, split.right_stats, all_features);
+
+            if (right_split.is_valid && right_split.gain >= config_.min_split_gain) {
+                LeafCandidate right_candidate;
+                right_candidate.node_idx = right_child;
+                right_candidate.split = right_split;
+                right_candidate.indices = std::move(right_indices);
+                right_candidate.depth = current_depth + 1;
+                right_candidate.stats = split.right_stats;
+                candidates.push(std::move(right_candidate));
+            } else {
+                make_leaf(right_child, split.right_stats);
+            }
+        } else {
+            make_leaf(right_child, split.right_stats);
+        }
+    }
+
+    // Make remaining candidates into leaves
+    while (!candidates.empty()) {
+        LeafCandidate remaining = std::move(const_cast<LeafCandidate&>(candidates.top()));
+        candidates.pop();
+        make_leaf(remaining.node_idx, remaining.stats);
+    }
 }
 
 Float Tree::predict(const Float* features, FeatureIndex n_features) const {
@@ -353,6 +663,20 @@ void Tree::predict_batch(
     }
 }
 
+void Tree::predict_batch(const Dataset& data, Float* output) const {
+    Index n_samples = data.n_samples();
+
+    if (nodes_.empty()) {
+        std::memset(output, 0, n_samples * sizeof(Float));
+        return;
+    }
+
+    #pragma omp parallel for
+    for (Index i = 0; i < n_samples; ++i) {
+        output[i] = predict(data, i);
+    }
+}
+
 void Tree::update_leaf_values(const Dataset& dataset, const std::vector<Index>& indices) {
     // Recompute leaf values based on current gradients
     std::vector<GradientPair> leaf_stats(nodes_.size());
@@ -378,7 +702,14 @@ void Tree::update_leaf_values(const Dataset& dataset, const std::vector<Index>& 
     
     for (TreeIndex i = 0; i < nodes_.size(); ++i) {
         if (nodes_[i].is_leaf && leaf_stats[i].count > 0) {
-            nodes_[i].value = -leaf_stats[i].grad / (leaf_stats[i].hess + config_.lambda_l2);
+            Float raw_value = -leaf_stats[i].grad / (leaf_stats[i].hess + config_.lambda_l2);
+            if (config_.leaf_smooth > 0.0f) {
+                Float shrink_factor = static_cast<Float>(leaf_stats[i].count) /
+                                     (static_cast<Float>(leaf_stats[i].count) + config_.leaf_smooth);
+                nodes_[i].value = raw_value * shrink_factor;
+            } else {
+                nodes_[i].value = raw_value;
+            }
         }
     }
 }
@@ -591,8 +922,16 @@ void Tree::make_leaf_multiclass(
         }
     }
 
+    // Optional smoothing based on sample count
+    Float shrink_factor = 1.0f;
+    if (config_.leaf_smooth > 0.0f) {
+        shrink_factor = static_cast<Float>(indices.size()) /
+                       (static_cast<Float>(indices.size()) + config_.leaf_smooth);
+    }
+
     for (uint32_t c = 0; c < n_classes_; ++c) {
-        Float value = -grad_sum[c] / (hess_sum[c] + config_.lambda_l2);
+        Float raw_value = -grad_sum[c] / (hess_sum[c] + config_.lambda_l2);
+        Float value = raw_value * shrink_factor;
 
         // Apply delta step constraint
         if (config_.max_delta_step > 0) {
@@ -834,185 +1173,32 @@ void TreeEnsemble::prepare_for_inference() {
 void TreeEnsemble::predict_batch_optimized(const Dataset& data, Float* output, int n_threads) const {
     Index n_samples = data.n_samples();
     size_t n_trees_local = trees_.size();
-
-    // Debug: Check ensemble state
-    static bool debug_printed = false;
-    if (!debug_printed && n_trees_local > 0) {
-        size_t empty_trees = 0;
-        Float total_leaf_sum = 0.0f;
-        int leaf_count = 0;
-        for (size_t t = 0; t < std::min(n_trees_local, size_t(3)); ++t) {
-            const auto& nodes = trees_[t]->nodes();
-            if (nodes.empty()) {
-                empty_trees++;
-            } else {
-                for (const auto& node : nodes) {
-                    if (node.is_leaf) {
-                        total_leaf_sum += node.value;
-                        leaf_count++;
-                    }
-                }
-            }
-        }
-        std::printf("[DEBUG] predict_batch_optimized: n_trees=%zu, empty_trees=%zu, leaf_values_sum=%.6f, leaf_count=%d\n",
-                   n_trees_local, empty_trees, total_leaf_sum, leaf_count);
-        std::fflush(stdout);
-        debug_printed = true;
-    }
+    FeatureIndex n_features = data.n_features();
 
     if (n_trees_local == 0) {
         std::memset(output, 0, n_samples * sizeof(Float));
         return;
     }
 
+    // Prepare flat representation for ultra-fast inference
+    const_cast<TreeEnsemble*>(this)->prepare_for_inference();
+
     // Initialize output to zero
     std::memset(output, 0, n_samples * sizeof(Float));
 
-    // Optimized approach: Process all trees for each sample
-    // This is more cache-friendly for the sample's feature data
-    // Also use std::thread for parallelism when OpenMP is unavailable
+    const auto& binned = data.binned();
 
-    const auto process_range = [&](Index start, Index end) {
-        for (Index row = start; row < end; ++row) {
-            Float sum = 0.0f;
-
-            // Process all trees for this sample
-            for (size_t t = 0; t < n_trees_local; ++t) {
-                const auto& nodes = trees_[t]->nodes();
-                if (nodes.empty()) continue;
-
-                Float weight = tree_weights_[t];
-                TreeIndex node_idx = 0;
-
-                // Traverse tree - optimized tight loop
-                while (!nodes[node_idx].is_leaf) {
-                    const TreeNode& node = nodes[node_idx];
-                    BinIndex bin = data.binned().get(row, node.split_feature);
-
-                    // Branchless for non-NaN case (most common)
-                    if (__builtin_expect(bin != 255, 1)) {
-                        node_idx = (bin > node.split_bin) ? node.right_child : node.left_child;
-                    } else {
-                        node_idx = node.default_left ? node.left_child : node.right_child;
-                    }
-                }
-
-                sum += weight * nodes[node_idx].value;
-            }
-
-            output[row] = sum;
-        }
-    };
-
-    // Determine number of threads to use
-    int num_threads = n_threads;
-    if (num_threads <= 0) {
-        num_threads = static_cast<int>(std::thread::hardware_concurrency());
-        if (num_threads <= 0) num_threads = 1;
+    // Pre-cache column pointers for all features
+    std::vector<const BinIndex*> column_ptrs(n_features);
+    for (FeatureIndex f = 0; f < n_features; ++f) {
+        column_ptrs[f] = binned.column(f);
     }
 
-    // For small datasets or when explicitly single-threaded
-    if (num_threads == 1 || n_samples < 1000) {
-        process_range(0, n_samples);
-        return;
-    }
-
-    // Use OpenMP if available
-    #ifdef _OPENMP
-    int old_threads = omp_get_max_threads();
-    omp_set_num_threads(num_threads);
-
-    #pragma omp parallel for schedule(static)
-    for (Index row = 0; row < n_samples; ++row) {
-        Float sum = 0.0f;
-
-        for (size_t t = 0; t < n_trees_local; ++t) {
-            const auto& nodes = trees_[t]->nodes();
-            if (nodes.empty()) continue;
-
-            Float weight = tree_weights_[t];
-            TreeIndex node_idx = 0;
-
-            while (!nodes[node_idx].is_leaf) {
-                const TreeNode& node = nodes[node_idx];
-                BinIndex bin = data.binned().get(row, node.split_feature);
-
-                if (__builtin_expect(bin != 255, 1)) {
-                    node_idx = (bin > node.split_bin) ? node.right_child : node.left_child;
-                } else {
-                    node_idx = node.default_left ? node.left_child : node.right_child;
-                }
-            }
-
-            sum += weight * nodes[node_idx].value;
-        }
-
-        output[row] = sum;
-    }
-
-    omp_set_num_threads(old_threads);
-    #else
-    // Use std::thread for parallelism
-    std::vector<std::thread> threads;
-    threads.reserve(num_threads);
-
-    Index chunk_size = (n_samples + num_threads - 1) / num_threads;
-
-    for (int i = 0; i < num_threads; ++i) {
-        Index start = i * chunk_size;
-        Index end = std::min(start + chunk_size, n_samples);
-        if (start < end) {
-            threads.emplace_back(process_range, start, end);
-        }
-    }
-
-    for (auto& t : threads) {
-        t.join();
-    }
-    #endif
-}
-
-void TreeEnsemble::predict_batch_multiclass_optimized(const Dataset& data, Float* output, int n_threads) const {
-    Index n_samples = data.n_samples();
-    size_t n_trees_local = trees_.size();
-    uint32_t n_classes = n_classes_;
-
-    if (n_trees_local == 0 || n_classes == 0) {
-        std::memset(output, 0, n_samples * n_classes * sizeof(Float));
-        return;
-    }
-
-    // Initialize output to zero
-    std::memset(output, 0, n_samples * n_classes * sizeof(Float));
-
-    // Process function for a range of samples
-    const auto process_range = [&](Index start, Index end) {
-        for (Index row = start; row < end; ++row) {
-            Float* row_output = output + row * n_classes;
-
-            for (size_t t = 0; t < n_trees_local; ++t) {
-                const auto& nodes = trees_[t]->nodes();
-                if (nodes.empty()) continue;
-
-                Float weight = tree_weights_[t];
-                uint32_t class_idx = tree_class_indices_[t];
-                TreeIndex node_idx = 0;
-
-                while (!nodes[node_idx].is_leaf) {
-                    const TreeNode& node = nodes[node_idx];
-                    BinIndex bin = data.binned().get(row, node.split_feature);
-
-                    if (__builtin_expect(bin != 255, 1)) {
-                        node_idx = (bin > node.split_bin) ? node.right_child : node.left_child;
-                    } else {
-                        node_idx = node.default_left ? node.left_child : node.right_child;
-                    }
-                }
-
-                row_output[class_idx] += weight * nodes[node_idx].value;
-            }
-        }
-    };
+    // Get pointers to flat data structures
+    const TreeNode* flat_nodes = flat_nodes_.data();
+    const size_t* offsets = tree_offsets_.data();
+    const Float* weights = tree_weights_.data();
+    const BinIndex* const* cols = column_ptrs.data();
 
     // Determine number of threads
     int num_threads = n_threads;
@@ -1021,62 +1207,98 @@ void TreeEnsemble::predict_batch_multiclass_optimized(const Dataset& data, Float
         if (num_threads <= 0) num_threads = 1;
     }
 
-    if (num_threads == 1 || n_samples < 1000) {
-        process_range(0, n_samples);
+    // Use simple parallel loop - most effective for this workload
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static) num_threads(num_threads)
+    #endif
+    for (Index row = 0; row < n_samples; ++row) {
+        Float sum = 0.0f;
+
+        for (size_t t = 0; t < n_trees_local; ++t) {
+            TreeIndex node_idx = static_cast<TreeIndex>(offsets[t]);
+            Float weight = weights[t];
+
+            // Fast tree traversal using flat nodes array
+            while (!flat_nodes[node_idx].is_leaf) {
+                const TreeNode& node = flat_nodes[node_idx];
+                BinIndex bin = cols[node.split_feature][row];
+
+                // Branchless navigation
+                node_idx = (bin != 255 && bin > node.split_bin)
+                         ? node.right_child : node.left_child;
+            }
+
+            sum += weight * flat_nodes[node_idx].value;
+        }
+
+        output[row] = sum;
+    }
+}
+
+void TreeEnsemble::predict_batch_multiclass_optimized(const Dataset& data, Float* output, int n_threads) const {
+    Index n_samples = data.n_samples();
+    size_t n_trees_local = trees_.size();
+    uint32_t n_classes = n_classes_;
+    FeatureIndex n_features = data.n_features();
+
+    if (n_trees_local == 0 || n_classes == 0) {
+        std::memset(output, 0, n_samples * n_classes * sizeof(Float));
         return;
     }
 
-    #ifdef _OPENMP
-    int old_threads = omp_get_max_threads();
-    omp_set_num_threads(num_threads);
+    // Prepare flat representation for ultra-fast inference
+    const_cast<TreeEnsemble*>(this)->prepare_for_inference();
 
-    #pragma omp parallel for schedule(static)
+    // Initialize output to zero
+    std::memset(output, 0, n_samples * n_classes * sizeof(Float));
+
+    const auto& binned = data.binned();
+
+    // Pre-cache column pointers
+    std::vector<const BinIndex*> column_ptrs(n_features);
+    for (FeatureIndex f = 0; f < n_features; ++f) {
+        column_ptrs[f] = binned.column(f);
+    }
+
+    // Get pointers to flat data structures
+    const TreeNode* flat_nodes = flat_nodes_.data();
+    const size_t* offsets = tree_offsets_.data();
+    const Float* weights = tree_weights_.data();
+    const uint32_t* class_indices = tree_class_indices_.data();
+    const BinIndex* const* cols = column_ptrs.data();
+
+    // Determine number of threads
+    int num_threads = n_threads;
+    if (num_threads <= 0) {
+        num_threads = static_cast<int>(std::thread::hardware_concurrency());
+        if (num_threads <= 0) num_threads = 1;
+    }
+
+    // Use simple parallel loop
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static) num_threads(num_threads)
+    #endif
     for (Index row = 0; row < n_samples; ++row) {
         Float* row_output = output + row * n_classes;
 
         for (size_t t = 0; t < n_trees_local; ++t) {
-            const auto& nodes = trees_[t]->nodes();
-            if (nodes.empty()) continue;
+            TreeIndex node_idx = static_cast<TreeIndex>(offsets[t]);
+            Float weight = weights[t];
+            uint32_t class_idx = class_indices[t];
 
-            Float weight = tree_weights_[t];
-            uint32_t class_idx = tree_class_indices_[t];
-            TreeIndex node_idx = 0;
+            // Fast tree traversal using flat nodes array
+            while (!flat_nodes[node_idx].is_leaf) {
+                const TreeNode& node = flat_nodes[node_idx];
+                BinIndex bin = cols[node.split_feature][row];
 
-            while (!nodes[node_idx].is_leaf) {
-                const TreeNode& node = nodes[node_idx];
-                BinIndex bin = data.binned().get(row, node.split_feature);
-
-                if (__builtin_expect(bin != 255, 1)) {
-                    node_idx = (bin > node.split_bin) ? node.right_child : node.left_child;
-                } else {
-                    node_idx = node.default_left ? node.left_child : node.right_child;
-                }
+                // Branchless navigation
+                node_idx = (bin != 255 && bin > node.split_bin)
+                         ? node.right_child : node.left_child;
             }
 
-            row_output[class_idx] += weight * nodes[node_idx].value;
+            row_output[class_idx] += weight * flat_nodes[node_idx].value;
         }
     }
-
-    omp_set_num_threads(old_threads);
-    #else
-    // Use std::thread for parallelism
-    std::vector<std::thread> threads;
-    threads.reserve(num_threads);
-
-    Index chunk_size = (n_samples + num_threads - 1) / num_threads;
-
-    for (int i = 0; i < num_threads; ++i) {
-        Index start = i * chunk_size;
-        Index end = std::min(start + chunk_size, n_samples);
-        if (start < end) {
-            threads.emplace_back(process_range, start, end);
-        }
-    }
-
-    for (auto& t : threads) {
-        t.join();
-    }
-    #endif
 }
 
 void TreeEnsemble::sparsify(Float target_sparsity) {
@@ -1110,6 +1332,165 @@ void TreeEnsemble::sparsify(Float target_sparsity) {
     
     trees_ = std::move(new_trees);
     tree_weights_ = std::move(new_weights);
+}
+
+// ============================================================================
+// Tree Serialization
+// ============================================================================
+
+void Tree::save(std::ostream& out) const {
+    // Write tree metadata
+    uint16_t depth = depth_;
+    uint32_t n_classes = n_classes_;
+    uint32_t n_nodes = static_cast<uint32_t>(nodes_.size());
+    uint16_t n_leaves = n_leaves_;
+
+    out.write(reinterpret_cast<const char*>(&depth), sizeof(depth));
+    out.write(reinterpret_cast<const char*>(&n_classes), sizeof(n_classes));
+    out.write(reinterpret_cast<const char*>(&n_nodes), sizeof(n_nodes));
+    out.write(reinterpret_cast<const char*>(&n_leaves), sizeof(n_leaves));
+
+    // Write config (essential parts)
+    out.write(reinterpret_cast<const char*>(&config_.max_depth), sizeof(config_.max_depth));
+    out.write(reinterpret_cast<const char*>(&config_.lambda_l2), sizeof(config_.lambda_l2));
+
+    // Write nodes
+    for (const auto& node : nodes_) {
+        out.write(reinterpret_cast<const char*>(&node.split_feature), sizeof(node.split_feature));
+        out.write(reinterpret_cast<const char*>(&node.split_bin), sizeof(node.split_bin));
+        uint8_t flags = (node.is_leaf & 0x1) | ((node.default_left & 0x1) << 1);
+        out.write(reinterpret_cast<const char*>(&flags), sizeof(flags));
+        out.write(reinterpret_cast<const char*>(&node.left_child), sizeof(node.left_child));
+        out.write(reinterpret_cast<const char*>(&node.right_child), sizeof(node.right_child));
+        out.write(reinterpret_cast<const char*>(&node.value), sizeof(node.value));
+        out.write(reinterpret_cast<const char*>(&node.gain), sizeof(node.gain));
+    }
+
+    // Write multiclass leaf values if applicable
+    if (n_classes > 1) {
+        uint32_t n_multiclass_values = static_cast<uint32_t>(multiclass_leaf_values_.size());
+        out.write(reinterpret_cast<const char*>(&n_multiclass_values), sizeof(n_multiclass_values));
+        if (n_multiclass_values > 0) {
+            out.write(reinterpret_cast<const char*>(multiclass_leaf_values_.data()),
+                     n_multiclass_values * sizeof(Float));
+        }
+
+        // Write node_to_leaf_idx mapping
+        uint32_t n_mapping = static_cast<uint32_t>(node_to_leaf_idx_.size());
+        out.write(reinterpret_cast<const char*>(&n_mapping), sizeof(n_mapping));
+        if (n_mapping > 0) {
+            out.write(reinterpret_cast<const char*>(node_to_leaf_idx_.data()),
+                     n_mapping * sizeof(TreeIndex));
+        }
+    }
+}
+
+Tree Tree::load(std::istream& in) {
+    Tree tree;
+
+    // Read tree metadata
+    uint32_t n_nodes;
+    in.read(reinterpret_cast<char*>(&tree.depth_), sizeof(tree.depth_));
+    in.read(reinterpret_cast<char*>(&tree.n_classes_), sizeof(tree.n_classes_));
+    in.read(reinterpret_cast<char*>(&n_nodes), sizeof(n_nodes));
+    in.read(reinterpret_cast<char*>(&tree.n_leaves_), sizeof(tree.n_leaves_));
+
+    // Read config (essential parts)
+    in.read(reinterpret_cast<char*>(&tree.config_.max_depth), sizeof(tree.config_.max_depth));
+    in.read(reinterpret_cast<char*>(&tree.config_.lambda_l2), sizeof(tree.config_.lambda_l2));
+
+    // Read nodes
+    tree.nodes_.resize(n_nodes);
+    for (uint32_t i = 0; i < n_nodes; ++i) {
+        auto& node = tree.nodes_[i];
+        in.read(reinterpret_cast<char*>(&node.split_feature), sizeof(node.split_feature));
+        in.read(reinterpret_cast<char*>(&node.split_bin), sizeof(node.split_bin));
+        uint8_t flags;
+        in.read(reinterpret_cast<char*>(&flags), sizeof(flags));
+        node.is_leaf = flags & 0x1;
+        node.default_left = (flags >> 1) & 0x1;
+        in.read(reinterpret_cast<char*>(&node.left_child), sizeof(node.left_child));
+        in.read(reinterpret_cast<char*>(&node.right_child), sizeof(node.right_child));
+        in.read(reinterpret_cast<char*>(&node.value), sizeof(node.value));
+        in.read(reinterpret_cast<char*>(&node.gain), sizeof(node.gain));
+    }
+
+    // Read multiclass leaf values if applicable
+    if (tree.n_classes_ > 1) {
+        uint32_t n_multiclass_values;
+        in.read(reinterpret_cast<char*>(&n_multiclass_values), sizeof(n_multiclass_values));
+        if (n_multiclass_values > 0) {
+            tree.multiclass_leaf_values_.resize(n_multiclass_values);
+            in.read(reinterpret_cast<char*>(tree.multiclass_leaf_values_.data()),
+                   n_multiclass_values * sizeof(Float));
+        }
+
+        // Read node_to_leaf_idx mapping
+        uint32_t n_mapping;
+        in.read(reinterpret_cast<char*>(&n_mapping), sizeof(n_mapping));
+        if (n_mapping > 0) {
+            tree.node_to_leaf_idx_.resize(n_mapping);
+            in.read(reinterpret_cast<char*>(tree.node_to_leaf_idx_.data()),
+                   n_mapping * sizeof(TreeIndex));
+        }
+    }
+
+    return tree;
+}
+
+// ============================================================================
+// Ultra-fast prediction using FlatTreeEnsemble (Decision Tables)
+// ============================================================================
+
+void TreeEnsemble::predict_batch_flat(const Dataset& data, Float* output, int n_threads) const {
+    Index n_samples = data.n_samples();
+    size_t n_trees_local = trees_.size();
+    FeatureIndex n_features = data.n_features();
+
+    if (n_trees_local == 0) {
+        std::memset(output, 0, n_samples * sizeof(Float));
+        return;
+    }
+
+    // Initialize output to zero
+    std::memset(output, 0, n_samples * sizeof(Float));
+
+    const auto& binned = data.binned();
+
+    // Determine number of threads
+    int num_threads = n_threads;
+    if (num_threads <= 0) {
+        num_threads = static_cast<int>(std::thread::hardware_concurrency());
+        if (num_threads <= 0) num_threads = 1;
+    }
+
+    // SAMPLE-FIRST: process all trees for each sample
+    // Use direct column access without local caching (simpler, avoids allocation)
+
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static) num_threads(num_threads)
+    #endif
+    for (Index row = 0; row < n_samples; ++row) {
+        Float sum = 0.0f;
+
+        for (size_t t = 0; t < n_trees_local; ++t) {
+            const auto& nodes = trees_[t]->nodes();
+            if (nodes.empty()) continue;
+
+            Float weight = tree_weights_[t];
+            TreeIndex node_idx = 0;
+
+            while (!nodes[node_idx].is_leaf) {
+                const TreeNode& node = nodes[node_idx];
+                BinIndex bin = binned.get(row, node.split_feature);
+                node_idx = (bin > node.split_bin) ? node.right_child : node.left_child;
+            }
+
+            sum += weight * nodes[node_idx].value;
+        }
+
+        output[row] = sum;
+    }
 }
 
 } // namespace turbocat

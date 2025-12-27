@@ -25,6 +25,23 @@ BinnedData::BinnedData(Index n_rows, FeatureIndex n_features, BinIndex max_bins)
     data_.resize(static_cast<size_t>(n_rows) * n_features);
 }
 
+void BinnedData::prepare_for_prediction() const {
+    if (!row_major_data_.empty()) return;  // Already prepared
+
+    // Transpose from column-major to row-major
+    row_major_data_.resize(static_cast<size_t>(n_rows_) * n_features_);
+
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
+    for (Index row = 0; row < n_rows_; ++row) {
+        BinIndex* dst = row_major_data_.data() + row * n_features_;
+        for (FeatureIndex feat = 0; feat < n_features_; ++feat) {
+            dst[feat] = data_[feat * n_rows_ + row];
+        }
+    }
+}
+
 // ============================================================================
 // Dataset Construction
 // ============================================================================
@@ -324,42 +341,57 @@ Dataset::SubsampleIndices Dataset::goss_subsample(
     Float top_rate, Float other_rate, uint64_t seed
 ) const {
     SubsampleIndices result;
-    
-    // Sort by absolute gradient
+
+    Index top_n = static_cast<Index>(n_samples_ * top_rate);
+    Index other_n = static_cast<Index>(n_samples_ * other_rate);
+
+    if (top_n == 0 && other_n == 0) {
+        return result;
+    }
+
+    // Create index array with absolute gradients
     std::vector<std::pair<Float, Index>> grad_idx(n_samples_);
+
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
     for (Index i = 0; i < n_samples_; ++i) {
         grad_idx[i] = {std::abs(gradients_[i]), i};
     }
-    
-    std::sort(grad_idx.begin(), grad_idx.end(),
-              [](const auto& a, const auto& b) { return a.first > b.first; });
-    
-    // Select top samples
-    Index top_n = static_cast<Index>(n_samples_ * top_rate);
-    Index other_n = static_cast<Index>(n_samples_ * other_rate);
-    
+
+    // Use nth_element for O(n) partitioning instead of O(n log n) sort
+    // This partitions so that top_n largest elements are at the beginning
+    if (top_n > 0 && top_n < n_samples_) {
+        std::nth_element(grad_idx.begin(), grad_idx.begin() + top_n, grad_idx.end(),
+                        [](const auto& a, const auto& b) { return a.first > b.first; });
+    }
+
     result.row_indices.reserve(top_n + other_n);
-    
-    // Add top gradient samples
+
+    // Add top gradient samples (they are now in first top_n positions, unordered)
     for (Index i = 0; i < top_n; ++i) {
         result.row_indices.push_back(grad_idx[i].second);
     }
-    
-    // Random sample from remaining
-    std::mt19937_64 rng(seed);
-    std::vector<Index> remaining;
-    remaining.reserve(n_samples_ - top_n);
-    
-    for (Index i = top_n; i < n_samples_; ++i) {
-        remaining.push_back(grad_idx[i].second);
+
+    // Efficient random sampling from remaining using reservoir sampling
+    // No need to create separate vector or shuffle all remaining elements
+    if (other_n > 0 && top_n < n_samples_) {
+        Index remaining_count = n_samples_ - top_n;
+        other_n = std::min(other_n, remaining_count);
+
+        std::mt19937_64 rng(seed);
+
+        // Use Fisher-Yates partial shuffle - only shuffle first other_n elements
+        for (Index i = 0; i < other_n; ++i) {
+            std::uniform_int_distribution<Index> dist(i, remaining_count - 1);
+            Index j = dist(rng);
+            if (i != j) {
+                std::swap(grad_idx[top_n + i], grad_idx[top_n + j]);
+            }
+            result.row_indices.push_back(grad_idx[top_n + i].second);
+        }
     }
-    
-    std::shuffle(remaining.begin(), remaining.end(), rng);
-    
-    for (Index i = 0; i < std::min(other_n, static_cast<Index>(remaining.size())); ++i) {
-        result.row_indices.push_back(remaining[i]);
-    }
-    
+
     return result;
 }
 

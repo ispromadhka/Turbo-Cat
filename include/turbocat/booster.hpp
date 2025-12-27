@@ -78,7 +78,15 @@ class Booster {
 public:
     Booster();
     explicit Booster(const Config& config);
-    
+
+    // Move operations
+    Booster(Booster&&) = default;
+    Booster& operator=(Booster&&) = default;
+
+    // Disable copy (has unique_ptr members)
+    Booster(const Booster&) = delete;
+    Booster& operator=(const Booster&) = delete;
+
     // ========================================================================
     // Training
     // ========================================================================
@@ -252,7 +260,12 @@ private:
     // ========================================================================
     // Internal Methods
     // ========================================================================
-    
+
+    /**
+     * Initialize loss function based on config
+     */
+    void init_loss();
+
     /**
      * Build single tree and add to ensemble (binary/regression)
      */
@@ -345,7 +358,7 @@ inline Booster quick_train(
     
     Booster booster(config);
     booster.train(data);
-    
+
     return booster;
 }
 

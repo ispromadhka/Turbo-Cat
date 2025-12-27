@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(TurboCat VERSION 0.1.0 LANGUAGES CXX)
+project(TurboCat VERSION 0.3.0 LANGUAGES CXX)
 
 # ============================================================================
 # TurboCat: Next-Generation Gradient Boosting Framework
@@ -33,9 +33,20 @@ check_cxx_compiler_flag("-mavx2" COMPILER_SUPPORTS_AVX2)
 set(COMPILER_SUPPORTS_AVX512 FALSE)
 check_cxx_compiler_flag("-mfma" COMPILER_SUPPORTS_FMA)
 
+# Check for ARM NEON
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64|ARM64")
+    set(COMPILER_SUPPORTS_NEON TRUE)
+else()
+    set(COMPILER_SUPPORTS_NEON FALSE)
+endif()
+
 set(TURBOCAT_SIMD_FLAGS "")
 
-if(COMPILER_SUPPORTS_AVX512)
+if(COMPILER_SUPPORTS_NEON)
+    # ARM NEON is always available on arm64
+    add_compile_definitions(TURBOCAT_NEON)
+    message(STATUS "TurboCat: ARM NEON support enabled (arm64)")
+elseif(COMPILER_SUPPORTS_AVX512)
     set(TURBOCAT_SIMD_FLAGS "-mavx512f -mavx512dq -mavx512cd -mavx512bw -mavx512vl")
     add_compile_definitions(TURBOCAT_AVX512)
     message(STATUS "TurboCat: AVX-512 support enabled")
@@ -72,6 +83,17 @@ option(TURBOCAT_USE_OPENMP "Use OpenMP for parallelization" ON)
 
 # OpenMP
 if(TURBOCAT_USE_OPENMP)
+    # On macOS, set hints for libomp
+    if(APPLE)
+        if(EXISTS "/usr/local/opt/libomp")
+            set(OpenMP_ROOT "/usr/local/opt/libomp")
+            list(APPEND CMAKE_PREFIX_PATH "/usr/local/opt/libomp")
+        elseif(EXISTS "/opt/homebrew/opt/libomp")
+            set(OpenMP_ROOT "/opt/homebrew/opt/libomp")
+            list(APPEND CMAKE_PREFIX_PATH "/opt/homebrew/opt/libomp")
+        endif()
+    endif()
+
     find_package(OpenMP)
     if(OpenMP_CXX_FOUND)
         message(STATUS "TurboCat: OpenMP support enabled")
@@ -116,6 +138,8 @@ set(TURBOCAT_CORE_SOURCES
     src/tree/histogram.cpp
     src/tree/splitter.cpp
     src/tree/tree.cpp
+    src/tree/flat_tree.cpp
+    src/tree/fast_ensemble.cpp
     src/tree/symmetric_tree.cpp
     src/tree/leaf_wise_tree.cpp
     src/tree/gradtree.cpp

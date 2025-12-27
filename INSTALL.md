@@ -1,337 +1,255 @@
-# 🛠️ Инструкция по установке TurboCat
+# TurboCat Installation Guide
 
-## Содержание
+## Quick Install
 
-1. [Требования](#требования)
-2. [Установка зависимостей](#установка-зависимостей)
-3. [Сборка из исходников](#сборка-из-исходников)
-4. [Python биндинги](#python-биндинги)
-5. [Проверка установки](#проверка-установки)
-6. [Troubleshooting](#troubleshooting)
+The simplest way to install TurboCat:
+
+```bash
+pip install turbocat
+```
+
+Or from source:
+
+```bash
+git clone https://github.com/ispromadhka/Turbo-Cat.git
+cd Turbo-Cat
+pip install .
+```
 
 ---
 
-## Требования
+## Requirements
 
-### Минимальные
+### Minimum
 
-| Компонент | Версия |
-|-----------|--------|
-| C++ компилятор | GCC 10+ / Clang 12+ / MSVC 2019+ |
+| Component | Version |
+|-----------|---------|
+| Python | 3.8+ |
+| C++ Compiler | GCC 10+ / Clang 12+ / MSVC 2019+ |
 | CMake | 3.18+ |
-| Git | любая |
 
-### Рекомендуемые (для максимальной производительности)
+### Recommended (for best performance)
 
-| Компонент | Версия | Зачем |
-|-----------|--------|-------|
-| GCC | 11+ | Лучшая поддержка AVX-512 |
-| OpenMP | 4.5+ | Многопоточность |
-| Eigen3 | 3.4+ | GradTree оптимизация |
-| Python | 3.8+ | Python API |
+| Component | Purpose |
+|-----------|---------|
+| OpenMP | Parallel training |
+| AVX2/AVX-512 | SIMD acceleration (x86) |
+| ARM NEON | SIMD acceleration (Apple Silicon) |
 
 ---
 
-## Установка зависимостей
-
-### Ubuntu / Debian
-
-```bash
-# Базовые инструменты
-sudo apt update
-sudo apt install -y build-essential cmake git
-
-# OpenMP
-sudo apt install -y libomp-dev
-
-# Eigen3 (опционально, CMake скачает если нет)
-sudo apt install -y libeigen3-dev
-
-# Python биндинги
-sudo apt install -y python3-dev python3-pip
-pip3 install numpy pybind11
-```
-
-### Fedora / RHEL / CentOS
-
-```bash
-sudo dnf install -y gcc-c++ cmake git
-sudo dnf install -y libomp-devel eigen3-devel
-sudo dnf install -y python3-devel python3-pip
-pip3 install numpy pybind11
-```
+## Platform-Specific Instructions
 
 ### macOS
 
 ```bash
-# Homebrew
-brew install cmake libomp eigen
+# Install OpenMP for parallel training
+brew install libomp
 
-# Python
-pip3 install numpy pybind11
+# Install TurboCat
+pip install turbocat
+```
+
+### Ubuntu / Debian
+
+```bash
+# Install dependencies
+sudo apt update
+sudo apt install -y build-essential cmake python3-dev python3-pip libomp-dev
+
+# Install TurboCat
+pip install turbocat
 ```
 
 ### Windows
 
-```powershell
-# Используйте Visual Studio 2019+ с C++ workload
-# Установите CMake: https://cmake.org/download/
+1. Install Visual Studio 2019+ with C++ workload
+2. Install CMake from https://cmake.org/download/
+3. Run: `pip install turbocat`
 
-# Или через vcpkg:
-vcpkg install eigen3 pybind11
+---
+
+## Building from Source
+
+### Step 1: Clone
+
+```bash
+git clone https://github.com/ispromadhka/Turbo-Cat.git
+cd Turbo-Cat
+```
+
+### Step 2: Install (pip method - recommended)
+
+```bash
+pip install .
+```
+
+### Step 3: Verify
+
+```python
+import turbocat
+print(turbocat.__version__)  # Should print 0.3.0
 ```
 
 ---
 
-## Сборка из исходников
+## Manual CMake Build
 
-### Шаг 1: Клонирование
-
-```bash
-git clone https://github.com/yourusername/turbocat.git
-cd turbocat
-```
-
-### Шаг 2: Создание build директории
+For development or custom builds:
 
 ```bash
-mkdir build
-cd build
-```
+mkdir build && cd build
 
-### Шаг 3: Конфигурация CMake
-
-**Базовая сборка:**
-```bash
-cmake .. -DCMAKE_BUILD_TYPE=Release
-```
-
-**Полная сборка со всеми опциями:**
-```bash
+# Configure
 cmake .. \
     -DCMAKE_BUILD_TYPE=Release \
     -DTURBOCAT_BUILD_PYTHON=ON \
-    -DTURBOCAT_BUILD_TESTS=ON \
-    -DTURBOCAT_BUILD_BENCHMARKS=ON \
-    -DTURBOCAT_USE_OPENMP=ON \
-    -DCMAKE_INSTALL_PREFIX=/usr/local
-```
+    -DTURBOCAT_BUILD_TESTS=ON
 
-**Опции CMake:**
+# Build
+cmake --build . --parallel
 
-| Опция | По умолчанию | Описание |
-|-------|--------------|----------|
-| `TURBOCAT_BUILD_PYTHON` | ON | Собирать Python биндинги |
-| `TURBOCAT_BUILD_TESTS` | ON | Собирать тесты |
-| `TURBOCAT_BUILD_BENCHMARKS` | ON | Собирать бенчмарки |
-| `TURBOCAT_USE_OPENMP` | ON | Использовать OpenMP |
-| `CMAKE_BUILD_TYPE` | Release | Debug/Release/RelWithDebInfo |
-
-### Шаг 4: Компиляция
-
-```bash
-# Используйте все ядра
-make -j$(nproc)
-
-# Или для Windows
-cmake --build . --config Release --parallel
-```
-
-### Шаг 5: Тестирование (опционально)
-
-```bash
-# Запуск всех тестов
-ctest --output-on-failure
-
-# Или напрямую
+# Run tests
 ./turbocat_tests
 ```
 
-### Шаг 6: Установка
+### CMake Options
 
-```bash
-# Системная установка
-sudo make install
-
-# Или в пользовательскую директорию
-cmake .. -DCMAKE_INSTALL_PREFIX=$HOME/.local
-make install
-```
-
----
-
-## Python биндинги
-
-### Способ 1: Через pip (рекомендуется)
-
-После сборки:
-```bash
-cd ../python
-pip install -e .
-```
-
-### Способ 2: Копирование модуля
-
-```bash
-# Найти собранный модуль
-find build -name "_turbocat*.so" -o -name "_turbocat*.pyd"
-
-# Скопировать в site-packages
-cp build/_turbocat*.so $(python -c "import site; print(site.getsitepackages()[0])")/
-```
-
-### Проверка Python установки
-
-```python
-import turbocat as tc
-
-# Вывести информацию о библиотеке
-tc.print_info()
-
-# Должно показать:
-# TurboCat v0.1.0
-#   SIMD: AVX-512 (или AVX2)
-#   OpenMP: Yes
-#   CUDA: No
-#   Metal: No
-```
+| Option | Default | Description |
+|--------|---------|-------------|
+| `TURBOCAT_BUILD_PYTHON` | ON | Build Python bindings |
+| `TURBOCAT_BUILD_TESTS` | ON | Build unit tests |
+| `TURBOCAT_BUILD_BENCHMARKS` | ON | Build benchmarks |
+| `TURBOCAT_USE_OPENMP` | ON | Enable OpenMP |
+| `CMAKE_BUILD_TYPE` | Release | Debug / Release |
 
 ---
 
-## Проверка установки
+## Verifying Installation
 
-### C++ тест
-
-Создайте файл `test_turbocat.cpp`:
-
-```cpp
-#include <turbocat/turbocat.hpp>
-#include <iostream>
-#include <vector>
-
-int main() {
-    turbocat::print_info();
-    
-    // Простой тест
-    std::vector<float> X = {1, 2, 3, 4, 5, 6};  // 2 samples, 3 features
-    std::vector<float> y = {0, 1};
-    
-    turbocat::Config config = turbocat::Config::binary_classification();
-    config.boosting.n_estimators = 10;
-    
-    turbocat::Dataset data;
-    data.from_dense(X.data(), 2, 3, y.data());
-    data.compute_bins(config);
-    
-    turbocat::Booster model(config);
-    model.train(data);
-    
-    std::cout << "✅ TurboCat работает!" << std::endl;
-    return 0;
-}
-```
-
-Компиляция:
-```bash
-g++ -std=c++20 test_turbocat.cpp -o test_turbocat \
-    -I/usr/local/include \
-    -L/usr/local/lib -lturbocat_core \
-    -fopenmp -mavx2
-./test_turbocat
-```
-
-### Python тест
+### Python Test
 
 ```python
-import turbocat as tc
+from turbocat import TurboCatClassifier
 import numpy as np
 
-# Генерируем данные
-np.random.seed(42)
-X = np.random.randn(1000, 10).astype(np.float32)
-y = (X[:, 0] + X[:, 1] > 0).astype(np.float32)
+# Quick test
+X = np.random.randn(100, 10).astype(np.float32)
+y = (X[:, 0] > 0).astype(np.float32)
 
-# Обучаем модель
-model = tc.Booster(task='binary', n_estimators=100)
-model.fit(X, y)
+clf = TurboCatClassifier(n_estimators=10, verbosity=0)
+clf.fit(X, y)
 
-# Предсказываем
-preds = model.predict_proba(X)
-accuracy = ((preds > 0.5) == y).mean()
+print("TurboCat installed successfully!")
+print(f"Trained {clf.n_trees} trees")
+```
 
-print(f"✅ Accuracy: {accuracy:.2%}")
+### Check SIMD Support
+
+```bash
+# Check CPU features (Linux)
+grep -o 'avx[^ ]*' /proc/cpuinfo | sort -u
+
+# Check CPU features (macOS)
+sysctl -a | grep cpu.features
 ```
 
 ---
 
 ## Troubleshooting
 
-### Ошибка: "AVX-512 not supported"
+### "OpenMP not found"
 
+**macOS:**
 ```bash
-# Проверьте поддержку CPU
-grep -o 'avx[^ ]*' /proc/cpuinfo | sort -u
-
-# Если нет AVX-512, соберите с AVX2:
-cmake .. -DCMAKE_CXX_FLAGS="-mavx2"
-```
-
-### Ошибка: "OpenMP not found"
-
-```bash
-# Ubuntu
-sudo apt install libomp-dev
-
-# macOS (с Homebrew)
 brew install libomp
-export OpenMP_ROOT=$(brew --prefix)/opt/libomp
+export OpenMP_ROOT=$(brew --prefix libomp)
+pip install . --no-cache-dir
 ```
 
-### Ошибка: "Eigen3 not found"
-
-CMake автоматически скачает Eigen3. Если нужна системная версия:
+**Ubuntu:**
 ```bash
-sudo apt install libeigen3-dev
-cmake .. -DEigen3_DIR=/usr/share/eigen3/cmake
+sudo apt install libomp-dev
 ```
 
-### Ошибка Python: "ModuleNotFoundError: No module named 'turbocat'"
+### "ModuleNotFoundError: No module named 'turbocat'"
 
 ```bash
-# Проверьте путь к модулю
-python -c "import sys; print(sys.path)"
+# Ensure you're using the correct Python
+python -m pip install turbocat
 
-# Добавьте путь к build
+# Or add build directory to path
 export PYTHONPATH=$PYTHONPATH:/path/to/turbocat/build
 ```
 
-### Медленная работа
+### Slow Performance
 
-1. Убедитесь что собрали в Release:
+1. Ensure Release build:
    ```bash
    cmake .. -DCMAKE_BUILD_TYPE=Release
    ```
 
-2. Проверьте SIMD флаги в выводе CMake:
+2. Check SIMD is enabled (look for in CMake output):
    ```
-   TurboCat: AVX-512 support enabled
+   TurboCat: ARM NEON support enabled
+   # or
+   TurboCat: AVX2 support enabled
    ```
 
-3. Включите OpenMP:
+3. Enable OpenMP:
    ```bash
    export OMP_NUM_THREADS=$(nproc)
    ```
 
+### Build Errors on Apple Silicon
+
+```bash
+# Use Homebrew's libomp
+export LDFLAGS="-L$(brew --prefix libomp)/lib"
+export CPPFLAGS="-I$(brew --prefix libomp)/include"
+pip install . --no-cache-dir
+```
+
 ---
 
-## Следующие шаги
+## Development Setup
 
-После успешной установки:
+For contributors:
 
-1. 📖 Изучите [README.md](README.md) для примеров использования
-2. 🧪 Запустите бенчмарки: `./turbocat_bench`
-3. 📊 Попробуйте на своих данных
+```bash
+# Clone with submodules
+git clone https://github.com/ispromadhka/Turbo-Cat.git
+cd Turbo-Cat
+
+# Create virtual environment
+python -m venv venv
+source venv/bin/activate  # Linux/macOS
+# or: venv\Scripts\activate  # Windows
+
+# Install dev dependencies
+pip install -e ".[dev]"
+
+# Build in debug mode
+mkdir build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Debug -DTURBOCAT_BUILD_TESTS=ON
+make -j8
+
+# Run tests
+./turbocat_tests
+ctest --output-on-failure
+```
 
 ---
 
-**Вопросы?** Создайте issue на GitHub!
+## Uninstalling
+
+```bash
+pip uninstall turbocat
+```
+
+---
+
+## Support
+
+- **Issues**: https://github.com/ispromadhka/Turbo-Cat/issues
+- **Documentation**: https://github.com/ispromadhka/Turbo-Cat#readme
