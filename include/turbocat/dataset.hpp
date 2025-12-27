@@ -27,30 +27,45 @@ class BinnedData {
 public:
     BinnedData() = default;
     BinnedData(Index n_rows, FeatureIndex n_features, BinIndex max_bins = 255);
-    
-    // Access binned values
+
+    // Access binned values (column-major)
     BinIndex get(Index row, FeatureIndex feature) const {
         return data_[feature * n_rows_ + row];
     }
-    
+
+    // Access from row-major layout (for prediction)
+    BinIndex get_row_major(Index row, FeatureIndex feature) const {
+        return row_major_data_[row * n_features_ + feature];
+    }
+
     void set(Index row, FeatureIndex feature, BinIndex bin) {
         data_[feature * n_rows_ + row] = bin;
     }
-    
+
     // Column access for histogram building
     const BinIndex* column(FeatureIndex feature) const {
         return data_.data() + feature * n_rows_;
     }
-    
+
     BinIndex* column(FeatureIndex feature) {
         return data_.data() + feature * n_rows_;
     }
-    
+
+    // Row access for prediction (returns pointer to row in row-major layout)
+    const BinIndex* row(Index row_idx) const {
+        return row_major_data_.data() + row_idx * n_features_;
+    }
+
+    // Prepare row-major layout for prediction
+    void prepare_for_prediction() const;
+    bool has_row_major() const { return !row_major_data_.empty(); }
+
     Index n_rows() const { return n_rows_; }
     FeatureIndex n_features() const { return n_features_; }
-    
+
 private:
-    AlignedVector<BinIndex> data_;
+    AlignedVector<BinIndex> data_;  // Column-major for training
+    mutable AlignedVector<BinIndex> row_major_data_;  // Row-major for prediction
     Index n_rows_ = 0;
     FeatureIndex n_features_ = 0;
 };

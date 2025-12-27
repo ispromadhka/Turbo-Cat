@@ -2,11 +2,12 @@
 
 /**
  * TurboCat Tree Structures
- * 
+ *
  * Includes:
  * - Standard decision tree (histogram-based)
  * - GradTree: Differentiable axis-aligned trees (AAAI 2024)
- * 
+ * - FlatTreeEnsemble: Ultra-fast decision tables for inference
+ *
  * GradTree innovation: Instead of greedy splitting, jointly optimize all
  * tree parameters via gradient descent. Uses dense representation with
  * differentiable feature selection and threshold optimization.
@@ -19,6 +20,7 @@
 #include <Eigen/Dense>
 #include <memory>
 #include <functional>
+#include "turbocat/flat_tree.hpp"
 
 namespace turbocat {
 
@@ -62,6 +64,9 @@ public:
         FeatureIndex n_features,
         Float* output
     ) const;
+
+    // Batch prediction using binned data (faster for training)
+    void predict_batch(const Dataset& data, Float* output) const;
 
     // Batch multiclass prediction (output: n_samples * n_classes)
     void predict_batch_multiclass(
@@ -123,6 +128,18 @@ private:
         uint16_t current_depth
     );
 
+    // Optimized build with histogram subtraction trick and pooled memory
+    void build_recursive_optimized(
+        TreeIndex node_idx,
+        const Dataset& dataset,
+        const std::vector<Index>& indices,
+        const std::vector<FeatureIndex>& features,
+        HistogramBuilder& hist_builder,
+        std::vector<Histogram>& hist_pool,
+        int hist_idx,
+        uint16_t current_depth
+    );
+
     // Build helpers for multiclass
     void build_recursive_multiclass(
         TreeIndex node_idx,
@@ -138,6 +155,13 @@ private:
 
     TreeIndex add_node();
     void make_leaf(TreeIndex node_idx, const GradientPair& stats);
+
+    // Leaf-wise (loss-guided) tree building
+    void build_leafwise(
+        const Dataset& dataset,
+        const std::vector<Index>& sample_indices,
+        HistogramBuilder& hist_builder
+    );
 
     // Make multiclass leaf (K values per leaf)
     void make_leaf_multiclass(
@@ -367,6 +391,14 @@ public:
     TreeEnsemble() = default;
     explicit TreeEnsemble(uint32_t n_classes) : n_classes_(n_classes) {}
 
+    // Move operations
+    TreeEnsemble(TreeEnsemble&&) = default;
+    TreeEnsemble& operator=(TreeEnsemble&&) = default;
+
+    // Disable copy (has unique_ptr members)
+    TreeEnsemble(const TreeEnsemble&) = delete;
+    TreeEnsemble& operator=(const TreeEnsemble&) = delete;
+
     void add_tree(std::unique_ptr<Tree> tree, Float weight = 1.0f);
     // void add_gradtree(std::unique_ptr<GradTree> tree, Float weight = 1.0f);
 
@@ -382,6 +414,9 @@ public:
 
     // Optimized batch prediction - processes samples in cache-friendly manner
     void predict_batch_optimized(const Dataset& data, Float* output, int n_threads = -1) const;
+
+    // Ultra-fast prediction using decision tables (FlatTree)
+    void predict_batch_flat(const Dataset& data, Float* output, int n_threads = -1) const;
 
     // Multiclass prediction (K-trees-per-iteration approach)
     void predict_multiclass(const Dataset& data, Index row, Float* output) const;
@@ -415,6 +450,10 @@ private:
     mutable bool inference_prepared_ = false;
     mutable std::vector<TreeNode> flat_nodes_;  // All nodes from all trees concatenated
     mutable std::vector<size_t> tree_offsets_;   // Offset into flat_nodes_ for each tree
+
+    // Ultra-fast decision table representation
+    mutable bool flat_trees_prepared_ = false;
+    mutable std::unique_ptr<FlatTreeEnsemble> flat_ensemble_;
 };
 
 } // namespace turbocat

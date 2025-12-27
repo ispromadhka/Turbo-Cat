@@ -413,24 +413,25 @@ SplitInfo SplitFinder::find_best_split_feature(
         }
         
         // Compute gain - optimized version using precomputed parent_gain
+        // XGBoost formula: Gain = 0.5 * [G_L²/(H_L+λ) + G_R²/(H_R+λ) - G²/(H+λ)] - γ
         Float gain;
         switch (config_.criterion) {
             case SplitCriterion::Variance: {
                 Float gain_left = (left_sum.grad * left_sum.grad) / (left_sum.hess + lambda);
                 Float gain_right = (right_sum.grad * right_sum.grad) / (right_sum.hess + lambda);
-                gain = 0.5f * (gain_left + gain_right - parent_gain);
+                gain = 0.5f * (gain_left + gain_right - parent_gain) - config_.gamma;
                 break;
             }
             case SplitCriterion::Gini:
-                gain = compute_gain_gini(left_sum, right_sum, parent_sum);
+                gain = compute_gain_gini(left_sum, right_sum, parent_sum) - config_.gamma;
                 break;
             case SplitCriterion::TsallisEntropy:
-                gain = compute_gain_tsallis(left_sum, right_sum, parent_sum, config_.tsallis_q);
+                gain = compute_gain_tsallis(left_sum, right_sum, parent_sum, config_.tsallis_q) - config_.gamma;
                 break;
             default:
                 Float gain_left = (left_sum.grad * left_sum.grad) / (left_sum.hess + lambda);
                 Float gain_right = (right_sum.grad * right_sum.grad) / (right_sum.hess + lambda);
-                gain = 0.5f * (gain_left + gain_right - parent_gain);
+                gain = 0.5f * (gain_left + gain_right - parent_gain) - config_.gamma;
         }
         
         if (gain > best.gain && gain >= config_.min_split_gain) {
@@ -448,17 +449,18 @@ SplitInfo SplitFinder::find_best_split_feature(
 }
 
 Float SplitFinder::compute_gain_variance(
-    const GradientPair& left, 
+    const GradientPair& left,
     const GradientPair& right,
     const GradientPair& parent
 ) const {
     Float lambda = config_.lambda_l2;
-    
+
     Float gain_left = (left.grad * left.grad) / (left.hess + lambda);
     Float gain_right = (right.grad * right.grad) / (right.hess + lambda);
     Float gain_parent = (parent.grad * parent.grad) / (parent.hess + lambda);
-    
-    return 0.5f * (gain_left + gain_right - gain_parent);
+
+    // XGBoost formula with gamma complexity penalty
+    return 0.5f * (gain_left + gain_right - gain_parent) - config_.gamma;
 }
 
 Float SplitFinder::compute_gain_gini(

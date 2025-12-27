@@ -17,16 +17,24 @@ namespace turbocat {
 // Tree Configuration
 // ============================================================================
 
+// Tree growing policy
+enum class GrowPolicy : uint8_t {
+    Depthwise = 0,  // Level-wise: grow all nodes at each depth (XGBoost/CatBoost style)
+    Lossguide = 1,  // Leaf-wise: grow leaf with highest gain (LightGBM style)
+};
+
 struct TreeConfig {
     // Structure
     uint16_t max_depth = 6;                    // Maximum tree depth
     uint32_t max_leaves = 64;                  // Maximum leaves (2^max_depth)
-    uint32_t min_samples_leaf = 1;             // Minimum samples per leaf (was 20)
-    Float min_child_weight = 0.1f;             // Minimum sum of hessians (was 1.0)
+    uint32_t min_samples_leaf = 1;             // Minimum samples per leaf
+    Float min_child_weight = 1.0f;             // Minimum sum of hessians (XGBoost default=1.0)
+    GrowPolicy grow_policy = GrowPolicy::Depthwise;  // Tree growing strategy
     
     // Split finding
     SplitCriterion criterion = SplitCriterion::Variance;
-    Float min_split_gain = 1e-7f;              // Minimum gain to make a split (was 1e-5)
+    Float min_split_gain = 0.0f;               // Minimum gain threshold (0 = disabled)
+    Float gamma = 0.0f;                        // Complexity penalty subtracted from gain (XGBoost-style)
     Float tsallis_q = 1.5f;                    // Tsallis entropy parameter
     
     // Histogram
@@ -34,9 +42,11 @@ struct TreeConfig {
     bool use_quantized_grad = false;           // Use 3-bit gradient quantization (was true - disabled for now)
     
     // Regularization
-    Float lambda_l2 = 0.1f;                    // L2 regularization on leaf values (was 1.0)
+    Float lambda_l2 = 1.0f;                    // L2 regularization on leaf values (XGBoost default=1.0)
     Float lambda_l1 = 0.0f;                    // L1 regularization (sparsity)
     Float max_delta_step = 0.0f;               // Maximum delta step (0 = unlimited)
+    Float leaf_smooth = 0.0f;                  // Leaf value smoothing weight (0 = disabled)
+                                               // shrink = count / (count + smooth), reduces overfitting
     
     // Missing values
     bool learn_missing_direction = true;       // Learn optimal direction for NaN
@@ -59,7 +69,7 @@ struct TreeConfig {
 struct BoostingConfig {
     // Ensemble
     uint32_t n_estimators = 1000;              // Number of trees
-    Float learning_rate = 0.05f;               // Shrinkage factor
+    Float learning_rate = 0.1f;                // Shrinkage factor (XGBoost default=0.3, LightGBM=0.1)
     Float subsample = 0.8f;                    // Row subsampling ratio
     Float colsample_bytree = 0.8f;             // Column subsampling per tree
     Float colsample_bylevel = 1.0f;            // Column subsampling per level
@@ -69,7 +79,7 @@ struct BoostingConfig {
     Float early_stopping_tolerance = 1e-5f;    // Minimum improvement
     
     // GOSS (Gradient-based One-Side Sampling)
-    bool use_goss = true;                      // Enable GOSS
+    bool use_goss = false;                     // Disabled by default (can hurt some datasets)
     Float goss_top_rate = 0.2f;                // Keep top 20% by gradient
     Float goss_other_rate = 0.1f;              // Sample 10% from rest
     
@@ -215,6 +225,8 @@ struct Config {
         cfg.task = TaskType::Regression;
         cfg.loss.loss_type = LossType::MSE;
         cfg.tree.criterion = SplitCriterion::Variance;
+        cfg.tree.lambda_l2 = 0.0f;  // Lower regularization for regression (MSE has hessian=2)
+        cfg.tree.grow_policy = GrowPolicy::Lossguide;  // Leaf-wise growth for better regression
         return cfg;
     }
     

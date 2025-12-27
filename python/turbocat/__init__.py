@@ -19,9 +19,265 @@ Example:
     >>> predictions = clf.predict_proba(X_test)
 """
 
-__version__ = "0.2.5"
+__version__ = "0.2.7-dev1"
 
 import numpy as np
+
+
+def _convert_to_onnx_classifier(model, initial_types=None):
+    """
+    Convert TurboCat classifier to ONNX format.
+
+    Note: The current export uses bin indices as split thresholds.
+    For accurate inference, input data should be pre-binned using the same
+    binning as training data, or use the native TurboCat predict methods.
+    """
+    try:
+        from onnx import helper, TensorProto
+        from onnx.helper import make_model, make_graph, make_node, make_tensor_value_info
+    except ImportError:
+        raise ImportError(
+            "ONNX export requires 'onnx' package. Install with: pip install onnx"
+        )
+
+    import warnings
+    warnings.warn(
+        "ONNX export uses histogram bin indices as thresholds. "
+        "For accurate predictions, ensure input data is binned identically to training. "
+        "Consider using native TurboCat predict() for production inference.",
+        UserWarning
+    )
+
+    # Get model structure
+    trees = model._model.get_booster_dump()
+    base_prediction = model._model.get_base_prediction()
+    n_features = model._model.get_n_features()
+    n_classes = getattr(model, '_params', {}).get('n_classes', 2)
+
+    # Build ONNX TreeEnsembleClassifier attributes
+    nodes_treeids = []
+    nodes_nodeids = []
+    nodes_featureids = []
+    nodes_values = []  # thresholds
+    nodes_modes = []
+    nodes_truenodeids = []
+    nodes_falsenodeids = []
+    nodes_missing_value_tracks_true = []
+
+    class_treeids = []
+    class_nodeids = []
+    class_ids = []
+    class_weights = []
+
+    for tree_id, tree in enumerate(trees):
+        weight = tree['weight']
+        nodes = tree['nodes']
+
+        for node_id, node in enumerate(nodes):
+            nodes_treeids.append(tree_id)
+            nodes_nodeids.append(node_id)
+
+            if node['is_leaf']:
+                nodes_featureids.append(0)
+                nodes_values.append(0.0)
+                nodes_modes.append("LEAF")
+                nodes_truenodeids.append(0)
+                nodes_falsenodeids.append(0)
+                nodes_missing_value_tracks_true.append(1 if node['default_left'] else 0)
+
+                # Leaf: add class weight
+                class_treeids.append(tree_id)
+                class_nodeids.append(node_id)
+                class_ids.append(1)  # Class 1 for binary
+                class_weights.append(float(node['value'] * weight))
+            else:
+                nodes_featureids.append(node['feature'])
+                nodes_values.append(float(node['threshold']))
+                nodes_modes.append("BRANCH_LEQ")
+                nodes_truenodeids.append(node['left_child'])
+                nodes_falsenodeids.append(node['right_child'])
+                nodes_missing_value_tracks_true.append(1 if node['default_left'] else 0)
+
+    # Create ONNX graph
+    input_name = "input"
+    output_label_name = "output_label"
+    output_prob_name = "output_probability"
+
+    # Input
+    X = make_tensor_value_info(input_name, TensorProto.FLOAT, [None, n_features])
+
+    # Outputs
+    output_label = make_tensor_value_info(output_label_name, TensorProto.INT64, [None])
+    output_prob = make_tensor_value_info(output_prob_name, TensorProto.FLOAT, [None, 2])
+
+    # TreeEnsembleClassifier node
+    tree_node = make_node(
+        'TreeEnsembleClassifier',
+        inputs=[input_name],
+        outputs=[output_label_name, output_prob_name],
+        domain='ai.onnx.ml',
+        name='TurboCatClassifier',
+        nodes_treeids=nodes_treeids,
+        nodes_nodeids=nodes_nodeids,
+        nodes_featureids=nodes_featureids,
+        nodes_values=nodes_values,
+        nodes_modes=nodes_modes,
+        nodes_truenodeids=nodes_truenodeids,
+        nodes_falsenodeids=nodes_falsenodeids,
+        nodes_missing_value_tracks_true=nodes_missing_value_tracks_true,
+        class_treeids=class_treeids,
+        class_nodeids=class_nodeids,
+        class_ids=class_ids,
+        class_weights=class_weights,
+        classlabels_int64s=[0, 1],
+        post_transform='LOGISTIC',
+        base_values=[float(base_prediction)],
+    )
+
+    graph = make_graph(
+        [tree_node],
+        'turbocat_classifier',
+        [X],
+        [output_label, output_prob]
+    )
+
+    # Create model with opset for ai.onnx.ml
+    from onnx import OperatorSetIdProto
+    opset_ml = OperatorSetIdProto()
+    opset_ml.domain = 'ai.onnx.ml'
+    opset_ml.version = 3
+
+    opset_onnx = OperatorSetIdProto()
+    opset_onnx.domain = ''
+    opset_onnx.version = 17
+
+    onnx_model = make_model(graph, opset_imports=[opset_onnx, opset_ml])
+    onnx_model.ir_version = 8
+
+    return onnx_model
+
+
+def _convert_to_onnx_regressor(model, initial_types=None):
+    """
+    Convert TurboCat regressor to ONNX format.
+
+    Note: The current export uses bin indices as split thresholds.
+    For accurate inference, input data should be pre-binned using the same
+    binning as training data, or use the native TurboCat predict methods.
+    """
+    try:
+        from onnx import helper, TensorProto
+        from onnx.helper import make_model, make_graph, make_node, make_tensor_value_info
+    except ImportError:
+        raise ImportError(
+            "ONNX export requires 'onnx' package. Install with: pip install onnx"
+        )
+
+    import warnings
+    warnings.warn(
+        "ONNX export uses histogram bin indices as thresholds. "
+        "For accurate predictions, ensure input data is binned identically to training. "
+        "Consider using native TurboCat predict() for production inference.",
+        UserWarning
+    )
+
+    # Get model structure
+    trees = model._model.get_booster_dump()
+    base_prediction = model._model.base_prediction
+    n_features = model._model.get_n_features()
+
+    # Build ONNX TreeEnsembleRegressor attributes
+    nodes_treeids = []
+    nodes_nodeids = []
+    nodes_featureids = []
+    nodes_values = []
+    nodes_modes = []
+    nodes_truenodeids = []
+    nodes_falsenodeids = []
+    nodes_missing_value_tracks_true = []
+
+    target_treeids = []
+    target_nodeids = []
+    target_ids = []
+    target_weights = []
+
+    for tree_id, tree in enumerate(trees):
+        weight = tree['weight']
+        nodes = tree['nodes']
+
+        for node_id, node in enumerate(nodes):
+            nodes_treeids.append(tree_id)
+            nodes_nodeids.append(node_id)
+
+            if node['is_leaf']:
+                nodes_featureids.append(0)
+                nodes_values.append(0.0)
+                nodes_modes.append("LEAF")
+                nodes_truenodeids.append(0)
+                nodes_falsenodeids.append(0)
+                nodes_missing_value_tracks_true.append(1 if node['default_left'] else 0)
+
+                # Leaf: add target weight
+                target_treeids.append(tree_id)
+                target_nodeids.append(node_id)
+                target_ids.append(0)
+                target_weights.append(float(node['value'] * weight))
+            else:
+                nodes_featureids.append(node['feature'])
+                nodes_values.append(float(node['threshold']))
+                nodes_modes.append("BRANCH_LEQ")
+                nodes_truenodeids.append(node['left_child'])
+                nodes_falsenodeids.append(node['right_child'])
+                nodes_missing_value_tracks_true.append(1 if node['default_left'] else 0)
+
+    # Create ONNX graph
+    input_name = "input"
+    output_name = "output"
+
+    X = make_tensor_value_info(input_name, TensorProto.FLOAT, [None, n_features])
+    Y = make_tensor_value_info(output_name, TensorProto.FLOAT, [None, 1])
+
+    # TreeEnsembleRegressor node
+    tree_node = make_node(
+        'TreeEnsembleRegressor',
+        inputs=[input_name],
+        outputs=[output_name],
+        domain='ai.onnx.ml',
+        name='TurboCatRegressor',
+        nodes_treeids=nodes_treeids,
+        nodes_nodeids=nodes_nodeids,
+        nodes_featureids=nodes_featureids,
+        nodes_values=nodes_values,
+        nodes_modes=nodes_modes,
+        nodes_truenodeids=nodes_truenodeids,
+        nodes_falsenodeids=nodes_falsenodeids,
+        nodes_missing_value_tracks_true=nodes_missing_value_tracks_true,
+        target_treeids=target_treeids,
+        target_nodeids=target_nodeids,
+        target_ids=target_ids,
+        target_weights=target_weights,
+        n_targets=1,
+        post_transform='NONE',
+        aggregate_function='SUM',
+        base_values=[float(base_prediction)],
+    )
+
+    graph = make_graph([tree_node], 'turbocat_regressor', [X], [Y])
+
+    from onnx import OperatorSetIdProto
+    opset_ml = OperatorSetIdProto()
+    opset_ml.domain = 'ai.onnx.ml'
+    opset_ml.version = 3
+
+    opset_onnx = OperatorSetIdProto()
+    opset_onnx.domain = ''
+    opset_onnx.version = 17
+
+    onnx_model = make_model(graph, opset_imports=[opset_onnx, opset_ml])
+    onnx_model.ir_version = 8
+
+    return onnx_model
+
 
 try:
     from ._turbocat import (
@@ -81,7 +337,7 @@ try:
         def __init__(
             self,
             n_estimators=1000,
-            learning_rate=0.05,
+            learning_rate=0.1,
             max_depth=6,
             max_bins=255,
             subsample=0.8,
@@ -89,11 +345,12 @@ try:
             min_child_weight=1.0,
             lambda_l2=1.0,
             loss="logloss",
-            use_goss=True,
+            use_goss=False,
             goss_top_rate=0.2,
             goss_other_rate=0.1,
             use_gradtree=False,
             use_symmetric=False,  # Oblivious trees (experimental)
+            use_ordered_boosting=False,  # Ordered boosting (like CatBoost)
             early_stopping_rounds=50,
             n_jobs=-1,
             n_threads=None,  # Alias for n_jobs
@@ -121,6 +378,7 @@ try:
                 goss_other_rate=goss_other_rate,
                 use_gradtree=use_gradtree,
                 use_symmetric=use_symmetric,
+                use_ordered_boosting=use_ordered_boosting,
                 early_stopping_rounds=early_stopping_rounds,
                 n_threads=effective_threads,
                 seed=seed,
@@ -142,6 +400,7 @@ try:
                 'goss_other_rate': goss_other_rate,
                 'use_gradtree': use_gradtree,
                 'use_symmetric': use_symmetric,
+                'use_ordered_boosting': use_ordered_boosting,
                 'early_stopping_rounds': early_stopping_rounds,
                 'n_jobs': n_jobs,
                 'seed': seed,
@@ -255,6 +514,51 @@ try:
             """Number of trees in the ensemble."""
             return self._model.n_trees
 
+        def to_onnx(self, initial_types=None):
+            """
+            Export model to ONNX format.
+
+            Parameters
+            ----------
+            initial_types : list of tuples, optional
+                Input types for ONNX model. If None, uses float32 input.
+                Example: [('input', FloatTensorType([None, n_features]))]
+
+            Returns
+            -------
+            onnx_model : onnx.ModelProto
+                ONNX model that can be saved or used with ONNX Runtime.
+
+            Examples
+            --------
+            >>> clf = TurboCatClassifier()
+            >>> clf.fit(X_train, y_train)
+            >>> onnx_model = clf.to_onnx()
+            >>> import onnx
+            >>> onnx.save(onnx_model, 'model.onnx')
+
+            Notes
+            -----
+            Requires onnx and onnxmltools packages:
+            pip install onnx onnxmltools
+            """
+            return _convert_to_onnx_classifier(self, initial_types)
+
+        def save_onnx(self, path, initial_types=None):
+            """
+            Save model to ONNX file.
+
+            Parameters
+            ----------
+            path : str
+                Path to save the ONNX model.
+            initial_types : list of tuples, optional
+                Input types for ONNX model.
+            """
+            import onnx
+            onnx_model = self.to_onnx(initial_types)
+            onnx.save(onnx_model, path)
+
     # Wrap TurboCatRegressor similarly
     class TurboCatRegressor:
         """
@@ -293,15 +597,16 @@ try:
         def __init__(
             self,
             n_estimators=1000,
-            learning_rate=0.05,
+            learning_rate=0.1,
             max_depth=6,
             loss="mse",
             subsample=0.8,
             colsample_bytree=0.8,
-            use_goss=True,
+            use_goss=False,
             goss_top_rate=0.2,
             goss_other_rate=0.1,
             early_stopping_rounds=50,
+            lambda_l2=0.0,
             n_jobs=-1,
             n_threads=None,
             seed=42,
@@ -323,6 +628,7 @@ try:
                 goss_top_rate=goss_top_rate,
                 goss_other_rate=goss_other_rate,
                 early_stopping_rounds=early_stopping_rounds,
+                lambda_l2=lambda_l2,
                 n_threads=effective_threads,
                 seed=seed,
                 verbosity=verbosity,
@@ -335,6 +641,7 @@ try:
                 'subsample': subsample,
                 'colsample_bytree': colsample_bytree,
                 'use_goss': use_goss,
+                'lambda_l2': lambda_l2,
                 'n_jobs': n_jobs,
                 'seed': seed,
                 'verbosity': verbosity,
@@ -428,6 +735,58 @@ try:
             """Set parameters (sklearn compatibility)."""
             self._params.update(params)
             return self
+
+        def save(self, path):
+            """Save model to file."""
+            self._model.save(path)
+
+        def load(self, path):
+            """Load model from file."""
+            self._model.load(path)
+            return self
+
+        def to_onnx(self, initial_types=None):
+            """
+            Export model to ONNX format.
+
+            Parameters
+            ----------
+            initial_types : list of tuples, optional
+                Input types for ONNX model. If None, uses float32 input.
+
+            Returns
+            -------
+            onnx_model : onnx.ModelProto
+                ONNX model that can be saved or used with ONNX Runtime.
+
+            Examples
+            --------
+            >>> reg = TurboCatRegressor()
+            >>> reg.fit(X_train, y_train)
+            >>> onnx_model = reg.to_onnx()
+            >>> import onnx
+            >>> onnx.save(onnx_model, 'model.onnx')
+
+            Notes
+            -----
+            Requires onnx package: pip install onnx
+            """
+            return _convert_to_onnx_regressor(self, initial_types)
+
+        def save_onnx(self, path, initial_types=None):
+            """
+            Save model to ONNX file.
+
+            Parameters
+            ----------
+            path : str
+                Path to save the ONNX model.
+            initial_types : list of tuples, optional
+                Input types for ONNX model.
+            """
+            import onnx
+            onnx_model = self.to_onnx(initial_types)
+            onnx.save(onnx_model, path)
 
 except ImportError as e:
     import warnings

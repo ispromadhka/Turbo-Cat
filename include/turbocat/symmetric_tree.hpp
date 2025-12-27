@@ -22,6 +22,9 @@
 
 namespace turbocat {
 
+// Forward declaration
+class FastEnsemble;
+
 // ============================================================================
 // Symmetric Tree Structure
 // ============================================================================
@@ -60,6 +63,10 @@ public:
 
     // Feature importance
     std::vector<Float> feature_importance() const;
+
+    // Accessors for FastEnsemble
+    const std::vector<SymmetricSplit>& splits() const { return splits_; }
+    const std::vector<Float>& leaf_values() const { return leaf_values_; }
 
 private:
     TreeConfig config_;
@@ -105,8 +112,17 @@ private:
 
 class SymmetricEnsemble {
 public:
-    SymmetricEnsemble() = default;
-    explicit SymmetricEnsemble(uint32_t n_classes) : n_classes_(n_classes) {}
+    SymmetricEnsemble();
+    explicit SymmetricEnsemble(uint32_t n_classes);
+    ~SymmetricEnsemble();
+
+    // Move operations
+    SymmetricEnsemble(SymmetricEnsemble&&) noexcept;
+    SymmetricEnsemble& operator=(SymmetricEnsemble&&) noexcept;
+
+    // Disable copy
+    SymmetricEnsemble(const SymmetricEnsemble&) = delete;
+    SymmetricEnsemble& operator=(const SymmetricEnsemble&) = delete;
 
     void add_tree(std::unique_ptr<SymmetricTree> tree, Float weight = 1.0f);
     void add_tree_for_class(std::unique_ptr<SymmetricTree> tree, Float weight, uint32_t class_idx);
@@ -125,11 +141,22 @@ public:
 
     std::vector<Float> feature_importance() const;
 
+    // Accessors for FastEnsemble
+    const SymmetricTree& tree(size_t idx) const { return *trees_[idx]; }
+    Float tree_weight(size_t idx) const { return tree_weights_[idx]; }
+
+    // Prepare fast ensemble for optimized prediction
+    void prepare_fast_ensemble() const;
+
 private:
     std::vector<std::unique_ptr<SymmetricTree>> trees_;
     std::vector<Float> tree_weights_;
     std::vector<uint32_t> tree_class_indices_;
     uint32_t n_classes_ = 1;
+
+    // Cached fast ensemble for SIMD prediction
+    mutable bool fast_prepared_ = false;
+    mutable std::unique_ptr<FastEnsemble> fast_ensemble_;
 };
 
 } // namespace turbocat

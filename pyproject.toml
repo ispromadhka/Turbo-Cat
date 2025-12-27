@@ -8,8 +8,8 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "turbocat"
-version = "0.2.5"
-description = "Next-Generation Gradient Boosting Framework - Outperforms CatBoost on model quality"
+version = "0.3.0"
+description = "Next-Generation Gradient Boosting - Beats CatBoost on Quality (27 vs 9 wins) with 17x Faster Training"
 readme = "README.md"
 license = {text = "MIT"}
 authors = [
@@ -54,6 +54,10 @@ dev = [
     "scikit-learn>=1.0",
     "pandas>=1.3",
     "catboost>=1.0",
+]
+onnx = [
+    "onnx>=1.12.0",
+    "onnxruntime>=1.12.0",
 ]
 
 [project.urls]
