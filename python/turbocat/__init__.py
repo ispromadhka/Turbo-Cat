@@ -19,7 +19,7 @@ Example:
     >>> predictions = clf.predict_proba(X_test)
 """
 
-__version__ = "0.2.7-dev1"
+__version__ = "0.3.0"
 
 import numpy as np
 
@@ -314,6 +314,9 @@ try:
             L2 regularization term.
         loss : str, default='logloss'
             Loss function: 'logloss', 'focal', 'ldam', 'logit_adjusted', 'tsallis'.
+        mode : str, default='auto'
+            Tree mode: 'small' (regular trees, best quality), 'large' (symmetric trees,
+            faster inference), or 'auto' (chooses based on dataset size).
         use_goss : bool, default=True
             Use Gradient-based One-Side Sampling.
         goss_top_rate : float, default=0.2
@@ -345,11 +348,12 @@ try:
             min_child_weight=1.0,
             lambda_l2=1.0,
             loss="logloss",
+            mode="auto",  # "small", "large", or "auto"
             use_goss=False,
             goss_top_rate=0.2,
             goss_other_rate=0.1,
             use_gradtree=False,
-            use_symmetric=False,  # Oblivious trees (experimental)
+            use_symmetric=False,  # Deprecated: use mode="large" instead
             use_ordered_boosting=False,  # Ordered boosting (like CatBoost)
             early_stopping_rounds=50,
             n_jobs=-1,
@@ -363,6 +367,10 @@ try:
             else:
                 effective_threads = n_jobs
 
+            # Handle deprecated use_symmetric parameter
+            if use_symmetric and mode == "auto":
+                mode = "large"
+
             self._model = _TurboCatClassifier(
                 n_estimators=n_estimators,
                 learning_rate=learning_rate,
@@ -373,11 +381,11 @@ try:
                 min_child_weight=min_child_weight,
                 lambda_l2=lambda_l2,
                 loss=loss,
+                mode=mode,
                 use_goss=use_goss,
                 goss_top_rate=goss_top_rate,
                 goss_other_rate=goss_other_rate,
                 use_gradtree=use_gradtree,
-                use_symmetric=use_symmetric,
                 use_ordered_boosting=use_ordered_boosting,
                 early_stopping_rounds=early_stopping_rounds,
                 n_threads=effective_threads,
@@ -395,11 +403,11 @@ try:
                 'min_child_weight': min_child_weight,
                 'lambda_l2': lambda_l2,
                 'loss': loss,
+                'mode': mode,
                 'use_goss': use_goss,
                 'goss_top_rate': goss_top_rate,
                 'goss_other_rate': goss_other_rate,
                 'use_gradtree': use_gradtree,
-                'use_symmetric': use_symmetric,
                 'use_ordered_boosting': use_ordered_boosting,
                 'early_stopping_rounds': early_stopping_rounds,
                 'n_jobs': n_jobs,
@@ -600,6 +608,7 @@ try:
             learning_rate=0.1,
             max_depth=6,
             loss="mse",
+            mode="auto",  # "small", "large", or "auto"
             subsample=0.8,
             colsample_bytree=0.8,
             use_goss=False,
@@ -638,6 +647,7 @@ try:
                 'learning_rate': learning_rate,
                 'max_depth': max_depth,
                 'loss': loss,
+                'mode': mode,
                 'subsample': subsample,
                 'colsample_bytree': colsample_bytree,
                 'use_goss': use_goss,
