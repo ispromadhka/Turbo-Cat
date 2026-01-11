@@ -7,11 +7,11 @@
 <a name="english"></a>
 # English
 
-**Next-generation gradient boosting that beats CatBoost on quality (27 vs 9 wins) with up to 17x faster training.**
+**Next-generation gradient boosting with up to 64x faster inference than CatBoost and comparable quality.**
 
-TurboCat is a high-performance C++ gradient boosting library with Python bindings, implementing cutting-edge research techniques: GradTree (AAAI 2024), Robust Focal Loss, Tsallis entropy splitting, SIMD-optimized gradients, and symmetric trees.
+TurboCat is a high-performance C++ gradient boosting library with Python bindings, implementing cutting-edge research techniques: GradTree (AAAI 2024), Robust Focal Loss, Tsallis entropy splitting, SIMD-optimized gradients, and symmetric trees with no-binning inference.
 
-[![Version](https://img.shields.io/badge/version-0.3.0-blue.svg)](https://github.com/ispromadhka/Turbo-Cat)
+[![Version](https://img.shields.io/badge/version-0.4.0-blue.svg)](https://github.com/ispromadhka/Turbo-Cat)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
@@ -22,128 +22,119 @@ TurboCat is a high-performance C++ gradient boosting library with Python binding
 - [x] **Multi-class classification** - Now supported!
 - [x] **Parallel training** - OpenMP enabled
 - [x] **SIMD optimization** - AVX2/AVX-512 and ARM NEON support
-- [x] **Symmetric trees** - `mode="large"` for fast inference
+- [x] **Symmetric trees** - Default mode for fast inference
 - [x] **Tree mode selection** - `mode` parameter: "small", "large", "auto"
+- [x] **Ultra-fast inference** - Up to 64x faster than CatBoost
 - [ ] **GPU support** - CUDA and Metal acceleration
 - [ ] **Model serialization** - Save/load trained models
 - [ ] **ONNX export** - For production deployment
 
 ---
 
-## Benchmark Results (v0.3.0)
+## Benchmark Results (v0.4.0)
 
-Comprehensive benchmark comparing TurboCat vs CatBoost on 6 datasets.
+Comprehensive benchmark comparing TurboCat vs CatBoost.
 
-**Configuration**: `n_estimators=500, max_depth=6, learning_rate=0.1, subsample=0.8`
+**Configuration**: `n_estimators=100, max_depth=6, learning_rate=0.1`
 
 ### Classification Results
 
-| Dataset | Samples | Features | TC AUC | CB AUC | AUC Diff | Train Speed | Winner |
-|---------|---------|----------|--------|--------|----------|-------------|--------|
-| Breast Cancer | 569 | 30 | **0.9950** | 0.9940 | +0.10% | **16.7x** | TC |
-| Small | 5,000 | 20 | **0.9875** | 0.9873 | +0.02% | **3.0x** | TC |
-| Medium | 20,000 | 30 | **0.9932** | 0.9919 | +0.13% | **1.3x** | TC |
-| Large | 50,000 | 40 | **0.9934** | 0.9933 | +0.02% | 0.86x | TC |
-| Imbalanced | 30,000 | 25 | **0.9725** | 0.9697 | +0.28% | **1.2x** | TC |
-| High-Dim | 10,000 | 100 | 0.9902 | **0.9910** | -0.08% | **1.8x** | CB |
+| Dataset | Samples | TC AUC | CB AUC | AUC Diff | Batch Inf | Single Inf | Winner |
+|---------|---------|--------|--------|----------|-----------|------------|--------|
+| Synthetic 50K | 50,000 | 0.9679 | **0.9694** | -0.15% | **2.1x** | **34x** | CB |
+| Synthetic 100K | 100,000 | **0.9704** | 0.9696 | +0.08% | **1.4x** | **35x** | TC |
+| Synthetic 200K | 200,000 | **0.9731** | 0.9730 | +0.01% | **1.1x** | **35x** | TC |
+| Breast Cancer | 569 | 0.9957 | **0.9961** | -0.04% | **7x** | **30x** | CB |
 
-### All Quality Metrics Summary
+### Regression Results
 
-| Metric | TurboCat Wins | CatBoost Wins |
-|--------|---------------|---------------|
-| ROC-AUC | 5 | 1 |
-| Accuracy | 4 | 2 |
-| Precision | 4 | 2 |
-| Recall | 4 | 2 |
-| F1-Score | 4 | 2 |
-| LogLoss | 6 | 0 |
-| **Total Quality** | **27** | **9** |
+| Dataset | Samples | TC R2 | CB R2 | R2 Diff | Batch Inf | Single Inf | Winner |
+|---------|---------|-------|-------|---------|-----------|------------|--------|
+| Synthetic 50K | 50,000 | **0.9640** | 0.9621 | +0.19% | **1.9x** | **63x** | TC |
+| Synthetic 100K | 100,000 | **0.9428** | 0.9412 | +0.16% | 1.0x | **64x** | TC |
+| California Housing | 20,640 | 0.7979 | 0.7978 | +0.01% | **2.4x** | **54x** | Tie |
 
 ### Speed Summary
 
-| Metric | TurboCat Wins | CatBoost Wins |
-|--------|---------------|---------------|
-| Training Speed | 5 | 1 |
-| Inference Speed | 1 | 5 |
-| **Total Speed** | **6** | **6** |
+| Metric | TurboCat vs CatBoost |
+|--------|---------------------|
+| Single Inference | **30-64x faster** |
+| Batch Inference | **1.1-7x faster** |
+| Training | 2-4x slower |
 
 ### Final Score
 
 | Category | TurboCat | CatBoost | Winner |
 |----------|----------|----------|--------|
-| Quality Metrics | **27** | 9 | TurboCat |
-| Speed Metrics | 6 | 6 | Tie |
-| **OVERALL** | **33** | **15** | **TurboCat** |
+| Classification Quality | 2 | 2 | Tie |
+| Regression Quality | 2 | 0 | TurboCat |
+| Inference Speed | 7 | 0 | TurboCat |
+| Training Speed | 0 | 7 | CatBoost |
+| **OVERALL** | **11** | **9** | **TurboCat** |
 
 ---
 
 ## Strengths
 
-### 1. Classification Quality - Key Advantage
+### 1. Inference Speed - Key Advantage
 
-TurboCat significantly outperforms CatBoost on classification:
-- **AUC**: Wins on 5 out of 6 datasets
-- **LogLoss**: Wins on ALL 6 datasets (up to +19% better)
-- **All Metrics**: 27 vs 9 quality wins
+TurboCat v0.4.0 delivers exceptional inference performance:
+- **Single-sample inference**: 30-64x faster than CatBoost
+- **Batch inference**: 1.1-7x faster than CatBoost
+- Perfect for real-time prediction and streaming data
 
-### 2. Training Speed
+### 2. Regression Quality
 
-- **Small datasets** (< 1K): up to **17x** faster
-- **Medium datasets** (1K-20K): **1.3-3x** faster
-- **Large datasets** (50K+): comparable
+On regression tasks, TurboCat now **beats CatBoost**:
 
-### 3. Imbalanced Data
+| Dataset | TC R2 | CB R2 | Difference |
+|---------|-------|-------|------------|
+| Synthetic 50K | **0.9640** | 0.9621 | **+0.19%** |
+| Synthetic 100K | **0.9428** | 0.9412 | **+0.16%** |
 
-On imbalanced datasets, TurboCat excels:
+### 3. Classification Quality
 
-| Dataset | TC AUC | CB AUC | Difference |
-|---------|--------|--------|------------|
-| Imbalanced 30K | **97.25%** | 96.97% | **+0.28%** |
-| Recall (minority) | **85.97%** | 83.39% | **+2.58%** |
+Comparable ROC-AUC on classification tasks:
+- Wins on 2 out of 4 datasets
+- Differences within ±0.15%
 
 ### 4. Advanced Features
 
 - **SIMD Optimizations**: AVX2/AVX-512 (x86) and NEON (ARM/Apple Silicon)
-- **Symmetric Trees**: O(1) leaf lookup for fast inference
-- **Tree Mode Selection**: Choose between quality and speed
+- **Symmetric Trees**: O(1) leaf lookup with float thresholds
+- **No-binning Inference**: Direct float comparisons for speed
+- **Focal Loss**: For imbalanced classification
 
 ---
 
 ## Weaknesses
 
-### 1. Inference Speed (with regular trees)
+### 1. Training Speed
 
-When using `mode="small"` (regular trees):
-- Inference is slower than CatBoost
-- Use `mode="large"` for faster inference at slight quality trade-off
+Training is slower than CatBoost due to symmetric tree construction:
+- Classification: 2-3x slower
+- Regression: 2-4x slower
 
-### 2. Symmetric Tree Training
-
-When using `mode="large"` (symmetric trees):
-- Training is slower than CatBoost's optimized symmetric implementation
-- Inference becomes competitive
+For training-heavy workflows, consider CatBoost.
 
 ---
 
 ## Tree Modes
 
-TurboCat v0.3.0 introduces the `mode` parameter:
+TurboCat v0.4.0 uses symmetric trees by default:
 
 | Mode | Tree Type | Best For |
 |------|-----------|----------|
-| `"small"` | Regular trees | **Best quality**, faster training |
-| `"large"` | Symmetric trees | Faster inference, comparable quality |
-| `"auto"` | Auto-select | Chooses based on data size |
+| `"small"` | Regular trees | Faster training |
+| `"large"` | Symmetric trees | **Fastest inference** |
+| `"auto"` | Symmetric (default) | Best balance |
 
 ```python
-# For best quality (default)
+# Default - symmetric trees for fast inference
+clf = TurboCatClassifier()
+
+# For faster training (slower inference)
 clf = TurboCatClassifier(mode="small")
-
-# For faster inference
-clf = TurboCatClassifier(mode="large")
-
-# Auto-select based on data size
-clf = TurboCatClassifier(mode="auto")
 ```
 
 ---
@@ -152,14 +143,14 @@ clf = TurboCatClassifier(mode="auto")
 
 ### Recommended:
 
-- **Binary/Multi-class classification** - TurboCat's strength
-- **Fraud detection, medical diagnosis** - imbalanced classes
-- **Real-time training** - up to 17x faster
-- **Quality-critical applications** - better AUC and LogLoss
+- **Real-time prediction** - 30-64x faster single inference
+- **Streaming data** - Low latency predictions
+- **Regression tasks** - Better R2 than CatBoost
+- **Imbalanced classification** - Focal loss support
 
 ### Consider Alternatives:
 
-- Very large inference batches with `mode="small"` (use `mode="large"` or CatBoost)
+- Training-heavy workflows (CatBoost is faster to train)
 - Native categorical feature support (CatBoost)
 - GPU training (XGBoost, LightGBM)
 
@@ -199,19 +190,17 @@ sudo apt install libomp-dev
 from turbocat import TurboCatClassifier
 import numpy as np
 
-# Create classifier
+# Create classifier (symmetric trees by default)
 clf = TurboCatClassifier(
     n_estimators=500,
     learning_rate=0.1,
-    max_depth=6,
-    subsample=0.8,
-    mode="small"  # Best quality
+    max_depth=6
 )
 
 # Train
 clf.fit(X_train, y_train)
 
-# Predict probabilities
+# Predict probabilities (fast!)
 proba = clf.predict_proba(X_test)
 
 # Predict classes
@@ -223,9 +212,9 @@ predictions = clf.predict(X_test)
 ```python
 from turbocat import TurboCatRegressor
 
-reg = TurboCatRegressor(n_estimators=500, learning_rate=0.1)
+reg = TurboCatRegressor(n_estimators=500, learning_rate=0.1, max_depth=6)
 reg.fit(X_train, y_train)
-predictions = reg.predict(X_test)
+predictions = reg.predict(X_test)  # Fast inference!
 ```
 
 ### Multi-class Classification
@@ -245,57 +234,67 @@ proba = clf.predict_proba(X_test)  # Returns (n_samples, n_classes)
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `n_estimators` | 1000 | Number of boosting iterations |
+| `n_estimators` | 500 | Number of boosting iterations |
 | `learning_rate` | 0.1 | Step size shrinkage |
 | `max_depth` | 6 | Maximum tree depth |
 | `max_bins` | 255 | Histogram bins |
-| `subsample` | 0.8 | Row sampling ratio |
+| `subsample` | 1.0 | Row sampling ratio |
 | `colsample_bytree` | 0.8 | Feature sampling ratio |
 | `min_child_weight` | 1.0 | Minimum leaf hessian sum |
 | `lambda_l2` | 1.0 | L2 regularization |
 | `mode` | "auto" | Tree type: "small", "large", "auto" |
-| `use_goss` | False | Use Gradient-based One-Side Sampling |
 | `n_threads` | -1 | Number of CPU cores (-1 = all) |
 | `verbosity` | 1 | Verbosity level (0=silent) |
 
 ---
 
-## Detailed Benchmark (v0.3.0)
+## Detailed Benchmark (v0.4.0)
 
 ```
-Dataset              TC AUC    CB AUC    Diff      Train     Winner
-────────────────────────────────────────────────────────────────────
-Breast Cancer        0.9950    0.9940    +0.10%    16.7x     TurboCat
-Small (5K)           0.9875    0.9873    +0.02%     3.0x     TurboCat
-Medium (20K)         0.9932    0.9919    +0.13%     1.3x     TurboCat
-Large (50K)          0.9934    0.9933    +0.02%     0.86x    TurboCat
-Imbalanced (30K)     0.9725    0.9697    +0.28%     1.2x     TurboCat
-High-Dim (100f)      0.9902    0.9910    -0.08%     1.8x     CatBoost
-────────────────────────────────────────────────────────────────────
-TOTAL                Quality: 27 vs 9    Speed: 6 vs 6    TurboCat WINS
+Dataset              TC AUC/R2  CB AUC/R2  Diff      Single Inf  Winner
+─────────────────────────────────────────────────────────────────────────
+Classification:
+Synthetic 50K        0.9679     0.9694     -0.15%    34x faster  CatBoost
+Synthetic 100K       0.9704     0.9696     +0.08%    35x faster  TurboCat
+Synthetic 200K       0.9731     0.9730     +0.01%    35x faster  TurboCat
+Breast Cancer        0.9957     0.9961     -0.04%    30x faster  CatBoost
+
+Regression:
+Synthetic 50K        0.9640     0.9621     +0.19%    63x faster  TurboCat
+Synthetic 100K       0.9428     0.9412     +0.16%    64x faster  TurboCat
+California Housing   0.7979     0.7978     +0.01%    54x faster  Tie
+─────────────────────────────────────────────────────────────────────────
+INFERENCE: 30-64x faster    QUALITY: Comparable    TurboCat WINS on Speed
 ```
 
 ---
 
-## What's New in v0.3.0
+## What's New in v0.4.0
 
-- **17x faster training** on small datasets
-- **SIMD-optimized gradients** with accurate sigmoid approximation
-- **ARM NEON support** for Apple Silicon
-- **Tree mode selection** (`mode` parameter)
-- **27 vs 9 quality wins** against CatBoost
-- **Improved symmetric trees** with tree batching and prefetching
+- **Single inference**: 30-64x faster than CatBoost
+- **Batch inference**: 1.1-7x faster (was 4.7x slower!)
+- **Regression quality**: Now beats CatBoost
+- **Symmetric trees by default**: No-binning prediction path
+- **Improved defaults**: Better out-of-the-box performance
+
+### v0.3.0
+
+- 17x faster training on small datasets
+- SIMD-optimized gradients
+- ARM NEON support for Apple Silicon
+- Tree mode selection
+- 27 vs 9 quality wins against CatBoost
 
 ---
 
 <a name="russian"></a>
 # Русский
 
-**Градиентный бустинг нового поколения — превосходит CatBoost по качеству (27 vs 9 побед), обучение до 17x быстрее.**
+**Градиентный бустинг нового поколения — инференс до 64x быстрее CatBoost при сопоставимом качестве.**
 
-TurboCat — высокопроизводительная библиотека градиентного бустинга на C++ с Python-привязками, реализующая современные исследовательские техники: GradTree (AAAI 2024), Robust Focal Loss, Tsallis entropy, SIMD-оптимизированные градиенты и симметричные деревья.
+TurboCat — высокопроизводительная библиотека градиентного бустинга на C++ с Python-привязками, реализующая современные техники: GradTree (AAAI 2024), Robust Focal Loss, Tsallis entropy, SIMD-оптимизированные градиенты и симметричные деревья с no-binning инференсом.
 
-[![Version](https://img.shields.io/badge/version-0.3.0-blue.svg)](https://github.com/ispromadhka/Turbo-Cat)
+[![Version](https://img.shields.io/badge/version-0.4.0-blue.svg)](https://github.com/ispromadhka/Turbo-Cat)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
@@ -306,104 +305,119 @@ TurboCat — высокопроизводительная библиотека �
 - [x] **Multi-class классификация** - Поддерживается!
 - [x] **Параллельное обучение** - OpenMP включен
 - [x] **SIMD оптимизация** - Поддержка AVX2/AVX-512 и ARM NEON
-- [x] **Симметричные деревья** - `mode="large"` для быстрого инференса
+- [x] **Симметричные деревья** - Режим по умолчанию для быстрого инференса
 - [x] **Выбор типа деревьев** - Параметр `mode`: "small", "large", "auto"
+- [x] **Ультра-быстрый инференс** - До 64x быстрее CatBoost
 - [ ] **GPU поддержка** - Ускорение на CUDA и Metal
 - [ ] **Сериализация моделей** - Сохранение/загрузка
 - [ ] **ONNX экспорт** - Для production deployment
 
 ---
 
-## Результаты бенчмарков (v0.3.0)
+## Результаты бенчмарков (v0.4.0)
 
-Комплексное сравнение TurboCat vs CatBoost на 6 датасетах.
+Сравнение TurboCat vs CatBoost.
 
-**Конфигурация**: `n_estimators=500, max_depth=6, learning_rate=0.1, subsample=0.8`
+**Конфигурация**: `n_estimators=100, max_depth=6, learning_rate=0.1`
 
 ### Результаты классификации
 
-| Датасет | Samples | Features | TC AUC | CB AUC | Разница | Скорость | Победитель |
-|---------|---------|----------|--------|--------|---------|----------|------------|
-| Breast Cancer | 569 | 30 | **0.9950** | 0.9940 | +0.10% | **16.7x** | TC |
-| Small | 5,000 | 20 | **0.9875** | 0.9873 | +0.02% | **3.0x** | TC |
-| Medium | 20,000 | 30 | **0.9932** | 0.9919 | +0.13% | **1.3x** | TC |
-| Large | 50,000 | 40 | **0.9934** | 0.9933 | +0.02% | 0.86x | TC |
-| Imbalanced | 30,000 | 25 | **0.9725** | 0.9697 | +0.28% | **1.2x** | TC |
-| High-Dim | 10,000 | 100 | 0.9902 | **0.9910** | -0.08% | **1.8x** | CB |
+| Датасет | Samples | TC AUC | CB AUC | Разница | Batch Inf | Single Inf | Победитель |
+|---------|---------|--------|--------|---------|-----------|------------|------------|
+| Synthetic 50K | 50,000 | 0.9679 | **0.9694** | -0.15% | **2.1x** | **34x** | CB |
+| Synthetic 100K | 100,000 | **0.9704** | 0.9696 | +0.08% | **1.4x** | **35x** | TC |
+| Synthetic 200K | 200,000 | **0.9731** | 0.9730 | +0.01% | **1.1x** | **35x** | TC |
+| Breast Cancer | 569 | 0.9957 | **0.9961** | -0.04% | **7x** | **30x** | CB |
 
-### Сводка по метрикам качества
+### Результаты регрессии
 
-| Метрика | Побед TurboCat | Побед CatBoost |
-|---------|----------------|----------------|
-| ROC-AUC | 5 | 1 |
-| Accuracy | 4 | 2 |
-| Precision | 4 | 2 |
-| Recall | 4 | 2 |
-| F1-Score | 4 | 2 |
-| LogLoss | 6 | 0 |
-| **Всего качество** | **27** | **9** |
+| Датасет | Samples | TC R2 | CB R2 | Разница | Batch Inf | Single Inf | Победитель |
+|---------|---------|-------|-------|---------|-----------|------------|------------|
+| Synthetic 50K | 50,000 | **0.9640** | 0.9621 | +0.19% | **1.9x** | **63x** | TC |
+| Synthetic 100K | 100,000 | **0.9428** | 0.9412 | +0.16% | 1.0x | **64x** | TC |
+| California Housing | 20,640 | 0.7979 | 0.7978 | +0.01% | **2.4x** | **54x** | Ничья |
+
+### Сводка по скорости
+
+| Метрика | TurboCat vs CatBoost |
+|---------|---------------------|
+| Single инференс | **30-64x быстрее** |
+| Batch инференс | **1.1-7x быстрее** |
+| Обучение | 2-4x медленнее |
 
 ### Финальный счёт
 
 | Категория | TurboCat | CatBoost | Победитель |
 |-----------|----------|----------|------------|
-| Метрики качества | **27** | 9 | TurboCat |
-| Метрики скорости | 6 | 6 | Ничья |
-| **ИТОГО** | **33** | **15** | **TurboCat** |
+| Качество классификации | 2 | 2 | Ничья |
+| Качество регрессии | 2 | 0 | TurboCat |
+| Скорость инференса | 7 | 0 | TurboCat |
+| Скорость обучения | 0 | 7 | CatBoost |
+| **ИТОГО** | **11** | **9** | **TurboCat** |
 
 ---
 
 ## Сильные стороны
 
-### 1. Качество классификации — главное преимущество
+### 1. Скорость инференса — главное преимущество
 
-TurboCat значительно превосходит CatBoost:
-- **AUC**: Побеждает на 5 из 6 датасетов
-- **LogLoss**: Побеждает на ВСЕХ 6 датасетах (до +19% лучше)
-- **Все метрики**: 27 vs 9 побед по качеству
+TurboCat v0.4.0 обеспечивает исключительную скорость предсказаний:
+- **Single-sample инференс**: 30-64x быстрее CatBoost
+- **Batch инференс**: 1.1-7x быстрее CatBoost
+- Идеально для real-time предсказаний и потоковых данных
 
-### 2. Скорость обучения
+### 2. Качество регрессии
 
-- **Малые датасеты** (< 1K): до **17x** быстрее
-- **Средние датасеты** (1K-20K): **1.3-3x** быстрее
-- **Большие датасеты** (50K+): сопоставимо
+На задачах регрессии TurboCat **превосходит CatBoost**:
 
-### 3. Несбалансированные данные
+| Датасет | TC R2 | CB R2 | Разница |
+|---------|-------|-------|---------|
+| Synthetic 50K | **0.9640** | 0.9621 | **+0.19%** |
+| Synthetic 100K | **0.9428** | 0.9412 | **+0.16%** |
 
-На несбалансированных данных TurboCat отлично работает:
+### 3. Качество классификации
 
-| Датасет | TC AUC | CB AUC | Разница |
-|---------|--------|--------|---------|
-| Imbalanced 30K | **97.25%** | 96.97% | **+0.28%** |
-| Recall (меньшинство) | **85.97%** | 83.39% | **+2.58%** |
+Сопоставимый ROC-AUC на задачах классификации:
+- Побеждает на 2 из 4 датасетов
+- Различия в пределах ±0.15%
 
 ### 4. Продвинутые возможности
 
 - **SIMD оптимизация**: AVX2/AVX-512 (x86) и NEON (ARM/Apple Silicon)
-- **Симметричные деревья**: O(1) поиск листа для быстрого инференса
-- **Выбор режима**: Баланс между качеством и скоростью
+- **Симметричные деревья**: O(1) поиск листа с float порогами
+- **No-binning инференс**: Прямые float сравнения
+- **Focal Loss**: Для несбалансированной классификации
+
+---
+
+## Слабые стороны
+
+### 1. Скорость обучения
+
+Обучение медленнее CatBoost из-за построения симметричных деревьев:
+- Классификация: 2-3x медленнее
+- Регрессия: 2-4x медленнее
+
+Для задач с частым переобучением рассмотрите CatBoost.
 
 ---
 
 ## Режимы деревьев
 
-TurboCat v0.3.0 вводит параметр `mode`:
+TurboCat v0.4.0 использует симметричные деревья по умолчанию:
 
 | Режим | Тип деревьев | Лучше для |
 |-------|--------------|-----------|
-| `"small"` | Обычные деревья | **Лучшее качество**, быстрое обучение |
-| `"large"` | Симметричные деревья | Быстрый инференс, сравнимое качество |
-| `"auto"` | Авто-выбор | Выбирает по размеру данных |
+| `"small"` | Обычные деревья | Быстрое обучение |
+| `"large"` | Симметричные | **Быстрейший инференс** |
+| `"auto"` | Симметричные (default) | Лучший баланс |
 
 ```python
-# Для лучшего качества (по умолчанию)
+# По умолчанию — симметричные деревья для быстрого инференса
+clf = TurboCatClassifier()
+
+# Для быстрого обучения (медленнее инференс)
 clf = TurboCatClassifier(mode="small")
-
-# Для быстрого инференса
-clf = TurboCatClassifier(mode="large")
-
-# Авто-выбор по размеру данных
-clf = TurboCatClassifier(mode="auto")
 ```
 
 ---
@@ -412,14 +426,14 @@ clf = TurboCatClassifier(mode="auto")
 
 ### Рекомендуется:
 
-- **Бинарная/Multi-class классификация** — сила TurboCat
-- **Fraud detection, медицинская диагностика** — несбалансированные классы
-- **Real-time обучение** — до 17x быстрее
-- **Критичные к качеству приложения** — лучше AUC и LogLoss
+- **Real-time предсказания** — 30-64x быстрее single inference
+- **Потоковые данные** — Низкая задержка
+- **Задачи регрессии** — Лучший R2 чем CatBoost
+- **Несбалансированная классификация** — Поддержка Focal Loss
 
 ### Рассмотреть альтернативы:
 
-- Большие батчи инференса с `mode="small"` (используйте `mode="large"` или CatBoost)
+- Частое переобучение (CatBoost быстрее обучается)
 - Нативная поддержка категориальных признаков (CatBoost)
 - GPU обучение (XGBoost, LightGBM)
 
@@ -459,19 +473,17 @@ sudo apt install libomp-dev
 from turbocat import TurboCatClassifier
 import numpy as np
 
-# Создание классификатора
+# Создание классификатора (симметричные деревья по умолчанию)
 clf = TurboCatClassifier(
     n_estimators=500,
     learning_rate=0.1,
-    max_depth=6,
-    subsample=0.8,
-    mode="small"  # Лучшее качество
+    max_depth=6
 )
 
 # Обучение
 clf.fit(X_train, y_train)
 
-# Предсказание вероятностей
+# Предсказание вероятностей (быстро!)
 proba = clf.predict_proba(X_test)
 
 # Предсказание классов
@@ -483,9 +495,9 @@ predictions = clf.predict(X_test)
 ```python
 from turbocat import TurboCatRegressor
 
-reg = TurboCatRegressor(n_estimators=500, learning_rate=0.1)
+reg = TurboCatRegressor(n_estimators=500, learning_rate=0.1, max_depth=6)
 reg.fit(X_train, y_train)
-predictions = reg.predict(X_test)
+predictions = reg.predict(X_test)  # Быстрый инференс!
 ```
 
 ### Multi-class классификация
@@ -505,46 +517,56 @@ proba = clf.predict_proba(X_test)  # Возвращает (n_samples, n_classes)
 
 | Параметр | По умолчанию | Описание |
 |----------|--------------|----------|
-| `n_estimators` | 1000 | Количество деревьев |
+| `n_estimators` | 500 | Количество деревьев |
 | `learning_rate` | 0.1 | Скорость обучения |
 | `max_depth` | 6 | Максимальная глубина дерева |
 | `max_bins` | 255 | Количество бинов гистограммы |
-| `subsample` | 0.8 | Доля сэмплов для обучения |
+| `subsample` | 1.0 | Доля сэмплов для обучения |
 | `colsample_bytree` | 0.8 | Доля признаков для дерева |
 | `min_child_weight` | 1.0 | Минимальный вес листа |
 | `lambda_l2` | 1.0 | L2 регуляризация |
 | `mode` | "auto" | Тип деревьев: "small", "large", "auto" |
-| `use_goss` | False | Использовать GOSS сэмплирование |
 | `n_threads` | -1 | Количество ядер CPU (-1 = все) |
 | `verbosity` | 1 | Уровень вывода (0=тихий) |
 
 ---
 
-## Детальный бенчмарк (v0.3.0)
+## Детальный бенчмарк (v0.4.0)
 
 ```
-Датасет              TC AUC    CB AUC    Разница   Скорость  Победитель
-────────────────────────────────────────────────────────────────────────
-Breast Cancer        0.9950    0.9940    +0.10%    16.7x     TurboCat
-Small (5K)           0.9875    0.9873    +0.02%     3.0x     TurboCat
-Medium (20K)         0.9932    0.9919    +0.13%     1.3x     TurboCat
-Large (50K)          0.9934    0.9933    +0.02%     0.86x    TurboCat
-Imbalanced (30K)     0.9725    0.9697    +0.28%     1.2x     TurboCat
-High-Dim (100f)      0.9902    0.9910    -0.08%     1.8x     CatBoost
-────────────────────────────────────────────────────────────────────────
-ИТОГО                Качество: 27 vs 9   Скорость: 6 vs 6   TurboCat WINS
+Датасет              TC AUC/R2  CB AUC/R2  Разница   Single Inf  Победитель
+─────────────────────────────────────────────────────────────────────────────
+Классификация:
+Synthetic 50K        0.9679     0.9694     -0.15%    34x быстрее CatBoost
+Synthetic 100K       0.9704     0.9696     +0.08%    35x быстрее TurboCat
+Synthetic 200K       0.9731     0.9730     +0.01%    35x быстрее TurboCat
+Breast Cancer        0.9957     0.9961     -0.04%    30x быстрее CatBoost
+
+Регрессия:
+Synthetic 50K        0.9640     0.9621     +0.19%    63x быстрее TurboCat
+Synthetic 100K       0.9428     0.9412     +0.16%    64x быстрее TurboCat
+California Housing   0.7979     0.7978     +0.01%    54x быстрее Ничья
+─────────────────────────────────────────────────────────────────────────────
+ИНФЕРЕНС: 30-64x быстрее    КАЧЕСТВО: Сопоставимо    TurboCat WINS по скорости
 ```
 
 ---
 
-## Что нового в v0.3.0
+## Что нового в v0.4.0
 
-- **Обучение в 17x быстрее** на малых датасетах
-- **SIMD-оптимизированные градиенты** с точной аппроксимацией сигмоиды
-- **Поддержка ARM NEON** для Apple Silicon
-- **Выбор режима деревьев** (параметр `mode`)
-- **27 vs 9 побед по качеству** против CatBoost
-- **Улучшенные симметричные деревья** с пакетной обработкой и prefetching
+- **Single инференс**: 30-64x быстрее CatBoost
+- **Batch инференс**: 1.1-7x быстрее (было 4.7x медленнее!)
+- **Качество регрессии**: Теперь превосходит CatBoost
+- **Симметричные деревья по умолчанию**: No-binning предсказания
+- **Улучшенные defaults**: Лучшая производительность из коробки
+
+### v0.3.0
+
+- Обучение в 17x быстрее на малых датасетах
+- SIMD-оптимизированные градиенты
+- Поддержка ARM NEON для Apple Silicon
+- Выбор режима деревьев
+- 27 vs 9 побед по качеству против CatBoost
 
 ---
 
