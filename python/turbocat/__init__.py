@@ -471,6 +471,28 @@ try:
             proba = self._model.predict_proba(X)
             return np.asarray(proba, dtype=np.float32)
 
+        def predict_proba_nobinning_fast(self, X):
+            """
+            FASTEST probability prediction - no binning + cached flat tree data + SIMD.
+
+            This is the recommended method for production inference.
+            Uses cached FastFloatEnsemble with column-major transpose for optimal SIMD.
+            Only works with symmetric trees (mode='large' or 'auto' with large data).
+
+            Parameters
+            ----------
+            X : array-like of shape (n_samples, n_features)
+                Input samples.
+
+            Returns
+            -------
+            proba : ndarray of shape (n_samples, n_classes)
+                Class probabilities.
+            """
+            X = np.asarray(X, dtype=np.float32)
+            proba = self._model.predict_proba_nobinning_fast(X)
+            return np.asarray(proba, dtype=np.float32)
+
         def predict(self, X, threshold=0.5):
             """
             Predict class labels for X.
@@ -631,6 +653,7 @@ try:
                 learning_rate=learning_rate,
                 max_depth=max_depth,
                 loss=loss,
+                mode=mode,
                 subsample=subsample,
                 colsample_bytree=colsample_bytree,
                 use_goss=use_goss,
@@ -673,7 +696,7 @@ try:
 
             return self
 
-        def predict(self, X):
+        def predict(self, X, timing=False):
             """
             Predict target values for X.
 
@@ -681,6 +704,8 @@ try:
             ----------
             X : array-like of shape (n_samples, n_features)
                 Input samples.
+            timing : bool, default=False
+                If True, print timing breakdown for prediction.
 
             Returns
             -------
@@ -696,7 +721,7 @@ try:
                 zero_var_features = np.sum(x_std < 1e-6)
                 print(f"[PY-DEBUG] X stats: mean_std={x_std.mean():.4f}, zero_var_features={zero_var_features}")
 
-            preds = np.asarray(self._model.predict(X), dtype=np.float32)
+            preds = np.asarray(self._model.predict(X, timing), dtype=np.float32)
 
             if self._params['verbosity'] > 0:
                 print(f"[PY-DEBUG] predict() done: preds range=[{preds.min():.6f}, {preds.max():.6f}], unique={len(np.unique(preds))}")
@@ -704,6 +729,71 @@ try:
                     print(f"[PY-DEBUG] WARNING: All predictions identical! This is likely a bug in binning or tree traversal.")
 
             return preds
+
+        def predict_fast(self, X, timing=False):
+            """
+            Fast prediction that avoids data copy.
+
+            Parameters
+            ----------
+            X : array-like of shape (n_samples, n_features)
+                Input samples.
+            timing : bool, default=False
+                If True, print timing information.
+
+            Returns
+            -------
+            y_pred : ndarray of shape (n_samples,)
+                Predicted values.
+            """
+            X = np.asarray(X, dtype=np.float32)
+            return np.asarray(self._model.predict_fast(X, timing), dtype=np.float32)
+
+        def predict_nobinning(self, X, timing=False):
+            """
+            No-binning prediction using raw float thresholds.
+
+            Fastest path that skips data binning entirely by using the raw
+            float thresholds stored in trees for direct comparison.
+            Only works with symmetric trees (mode='large' or auto with large data).
+
+            Parameters
+            ----------
+            X : array-like of shape (n_samples, n_features)
+                Input samples.
+            timing : bool, default=False
+                If True, print timing information.
+
+            Returns
+            -------
+            y_pred : ndarray of shape (n_samples,)
+                Predicted values.
+            """
+            X = np.asarray(X, dtype=np.float32)
+            return np.asarray(self._model.predict_nobinning(X, timing), dtype=np.float32)
+
+        def predict_nobinning_fast(self, X, timing=False):
+            """
+            FASTEST prediction - no binning + cached flat tree data + SIMD.
+
+            This is the recommended method for production inference.
+            Uses cached FastFloatEnsemble with column-major transpose for optimal SIMD.
+            Only works with symmetric trees (mode='large' or auto with large data).
+
+            Parameters
+            ----------
+            X : array-like of shape (n_samples, n_features)
+                Input samples.
+            timing : bool, default=False
+                If True, print timing information.
+
+            Returns
+            -------
+            y_pred : ndarray of shape (n_samples,)
+                Predicted values.
+            """
+            X = np.asarray(X, dtype=np.float32)
+            return np.asarray(self._model.predict_nobinning_fast(X, timing), dtype=np.float32)
 
         def debug_info(self):
             """Get debug information about the model."""

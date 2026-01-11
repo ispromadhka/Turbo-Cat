@@ -39,15 +39,19 @@ TEST(HistogramTest, BinAccess) {
 TEST(SplitFinderTest, GainComputation) {
     TreeConfig config;
     config.lambda_l2 = 1.0f;
-    
+
     SplitFinder finder(config);
-    
-    GradientPair left(2.0f, 4.0f, 10);
-    GradientPair right(1.0f, 2.0f, 5);
-    GradientPair parent = left + right;
-    
+
+    // For a good split, we need gradients that separate well
+    // Opposite signs on left/right produce positive gain when they
+    // cancel in parent (variance reduction)
+    GradientPair left(5.0f, 2.0f, 10);   // positive gradient
+    GradientPair right(-5.0f, 2.0f, 5);  // negative gradient
+    GradientPair parent = left + right;   // gradients cancel: sum=0
+
     Float gain = finder.compute_gain_variance(left, right, parent);
-    
+
     // Gain should be positive for a good split
+    // gain = 0.5 * (25/3 + 25/3 - 0/5) = 8.33
     EXPECT_GT(gain, 0.0f);
 }

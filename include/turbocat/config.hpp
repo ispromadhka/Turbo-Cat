@@ -76,12 +76,17 @@ struct BoostingConfig {
     
     // Early stopping
     uint32_t early_stopping_rounds = 50;       // Stop if no improvement
-    Float early_stopping_tolerance = 1e-5f;    // Minimum improvement
+    Float early_stopping_tolerance = 1e-4f;    // Relative improvement threshold (0.01%)
+    std::string early_stopping_metric = "loss"; // "loss", "roc_auc", "pr_auc", "f1"
     
     // GOSS (Gradient-based One-Side Sampling)
     bool use_goss = false;                     // Disabled by default (can hurt some datasets)
     Float goss_top_rate = 0.2f;                // Keep top 20% by gradient
     Float goss_other_rate = 0.1f;              // Sample 10% from rest
+
+    // MVS (Minimum Variance Sampling) - better for large datasets
+    bool use_mvs = false;                      // Use MVS instead of GOSS
+    Float mvs_subsample = 0.5f;                // MVS sample ratio (more aggressive than GOSS)
     
     // Dart (Dropouts meet Multiple Additive Regression Trees)
     bool use_dart = false;                     // Enable DART
@@ -147,6 +152,43 @@ struct CategoricalConfig {
 };
 
 // ============================================================================
+// Feature Interaction Configuration
+// ============================================================================
+
+struct InteractionConfig {
+    // Detection settings
+    bool auto_detect = false;                  // Auto-detect feature interactions
+    uint16_t max_interactions = 20;            // Maximum number of interactions to detect
+    Float min_interaction_gain = 0.01f;        // Minimum gain threshold for interaction
+
+    // Detection method
+    enum class DetectionMethod : uint8_t {
+        SplitBased = 0,       // Based on consecutive tree splits (fast)
+        MutualInfo = 1,       // Mutual information (accurate but slower)
+        Correlation = 2,      // Correlation-based (simple)
+    };
+    DetectionMethod method = DetectionMethod::SplitBased;
+
+    // Interaction types
+    bool numerical_numerical = true;           // Detect num×num interactions
+    bool numerical_categorical = true;         // Detect num×cat interactions
+    bool categorical_categorical = true;       // Detect cat×cat interactions
+
+    // Generated feature settings
+    enum class CombinationType : uint8_t {
+        Product = 0,          // a * b (numerical)
+        Ratio = 1,            // a / (b + eps) (numerical)
+        Sum = 2,              // a + b (numerical)
+        Difference = 3,       // a - b (numerical)
+        Concat = 4,           // hash(a, b) (categorical)
+    };
+    std::vector<CombinationType> combination_types = {CombinationType::Product};
+
+    // Manual interactions (always included)
+    std::vector<std::pair<FeatureIndex, FeatureIndex>> manual_interactions;
+};
+
+// ============================================================================
 // Device Configuration
 // ============================================================================
 
@@ -182,6 +224,7 @@ struct Config {
     BoostingConfig boosting;
     LossConfig loss;
     CategoricalConfig categorical;
+    InteractionConfig interactions;
     DeviceConfig device;
     
     // Verbosity and logging
@@ -258,6 +301,95 @@ struct Config {
         cfg.categorical.method = CategoricalConfig::EncodingMethod::CrossValidatedTS;
         cfg.loss.loss_type = LossType::RobustFocal;
         return cfg;
+    }
+
+    /**
+     * Adaptive configuration for large datasets (50K+ samples)
+     * Optimizes for both speed and quality on large data
+     */
+    static Config large_dataset() {
+        Config cfg;
+        cfg.tree.max_depth = 8;                        // Deeper trees for more data
+        cfg.tree.max_leaves = 128;
+        cfg.tree.min_samples_leaf = 20;                // Prevent overfitting
+        cfg.tree.min_child_weight = 20.0f;             // Higher weight threshold
+        cfg.tree.grow_policy = GrowPolicy::Lossguide;  // Leaf-wise for better accuracy
+        cfg.tree.lambda_l2 = 5.0f;                     // More regularization
+        cfg.tree.leaf_smooth = 10.0f;                  // Smooth leaf values
+        cfg.boosting.n_estimators = 2000;
+        cfg.boosting.learning_rate = 0.05f;            // Lower LR for stability
+        cfg.boosting.subsample = 0.7f;
+        cfg.boosting.colsample_bytree = 0.8f;
+        cfg.boosting.use_mvs = true;                   // MVS for large data
+        cfg.boosting.mvs_subsample = 0.5f;
+        cfg.boosting.early_stopping_rounds = 100;
+        return cfg;
+    }
+
+    /**
+     * Adaptive configuration for large regression datasets
+     * Specifically tuned for regression quality
+     */
+    static Config large_regression() {
+        Config cfg = large_dataset();
+        cfg.task = TaskType::Regression;
+        cfg.loss.loss_type = LossType::Huber;          // Robust to outliers
+        cfg.loss.huber_delta = 1.35f;                  // Good default
+        cfg.tree.criterion = SplitCriterion::Variance;
+        cfg.tree.lambda_l2 = 10.0f;                    // Strong regularization
+        cfg.tree.max_depth = 10;                       // Deeper for regression
+        cfg.tree.leaf_smooth = 20.0f;                  // More smoothing
+        cfg.boosting.learning_rate = 0.03f;            // Lower LR
+        cfg.boosting.n_estimators = 3000;
+        return cfg;
+    }
+
+    /**
+     * Automatically adapt config based on dataset characteristics
+     */
+    void adapt_to_data(Index n_samples, FeatureIndex n_features) {
+        // For smaller datasets: enable ordered boosting (like CatBoost)
+        // Prevents prediction shift and improves generalization
+        if (n_samples < 50000) {
+            boosting.use_ordered_boosting = true;
+            boosting.n_permutations = 4;
+        }
+
+        // For large datasets: deeper trees, more regularization, use MVS
+        if (n_samples >= 50000) {
+            tree.max_depth = std::max(tree.max_depth, static_cast<uint16_t>(8));
+            tree.max_leaves = std::max(tree.max_leaves, 128u);
+            tree.min_samples_leaf = std::max(tree.min_samples_leaf, 20u);
+            tree.min_child_weight = std::max(tree.min_child_weight, 10.0f);
+            tree.lambda_l2 = std::max(tree.lambda_l2, 5.0f);
+            tree.leaf_smooth = std::max(tree.leaf_smooth, 10.0f);
+            boosting.use_mvs = true;
+            boosting.mvs_subsample = 0.5f;
+            boosting.early_stopping_rounds = std::max(boosting.early_stopping_rounds, 100u);
+        }
+
+        // For very large datasets: even more aggressive sampling
+        if (n_samples >= 200000) {
+            tree.max_depth = std::max(tree.max_depth, static_cast<uint16_t>(10));
+            tree.max_leaves = std::max(tree.max_leaves, 256u);
+            tree.min_samples_leaf = std::max(tree.min_samples_leaf, 50u);
+            tree.min_child_weight = std::max(tree.min_child_weight, 30.0f);
+            tree.lambda_l2 = std::max(tree.lambda_l2, 10.0f);
+            boosting.mvs_subsample = 0.3f;
+            boosting.learning_rate = std::min(boosting.learning_rate, 0.03f);
+        }
+
+        // For high-dimensional data: more regularization, column sampling
+        if (n_features >= 100) {
+            boosting.colsample_bytree = std::min(boosting.colsample_bytree, 0.7f);
+            tree.lambda_l2 = std::max(tree.lambda_l2, 3.0f);
+        }
+
+        // For wide data (many features, fewer samples): prevent overfitting
+        if (n_features > n_samples / 10) {
+            boosting.colsample_bytree = std::min(boosting.colsample_bytree, 0.5f);
+            tree.max_depth = std::min(tree.max_depth, static_cast<uint16_t>(6));
+        }
     }
     
     // ========================================================================

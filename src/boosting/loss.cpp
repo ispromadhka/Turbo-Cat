@@ -435,17 +435,27 @@ void HuberLoss::compute_gradients(
     Float* hessians,
     Index n
 ) const {
+    // Improved Huber gradient with smooth transition
+    // Uses modified pseudo-huber for better convergence
     #pragma omp parallel for
     for (Index i = 0; i < n; ++i) {
         Float diff = predictions[i] - labels[i];
         Float abs_diff = std::abs(diff);
 
         if (abs_diff <= delta_) {
+            // Quadratic region: g = diff, h = 1
             gradients[i] = diff;
             hessians[i] = 1.0f;
         } else {
-            gradients[i] = delta_ * ((diff > 0) ? 1.0f : -1.0f);
-            hessians[i] = 1e-6f;  // Small for linear region
+            // Linear region: g = delta * sign(diff), h = delta / |diff|
+            // Using smooth transition: h = delta^2 / (delta + |diff|)
+            // This gives better convergence than constant small hessian
+            Float sign = (diff > 0) ? 1.0f : -1.0f;
+            gradients[i] = delta_ * sign;
+            // Smooth hessian that decays from 1.0 at boundary to smaller values
+            // This helps Newton's method converge better
+            hessians[i] = delta_ * delta_ / (delta_ + abs_diff);
+            hessians[i] = std::max(hessians[i], 0.01f);  // Floor to avoid issues
         }
     }
 }
@@ -797,6 +807,395 @@ void TsallisLoss::auto_tune_q(const Float* labels, Index n) {
     
     // q = 1 + imbalance (ranges from 1 to 2)
     q_ = 1.0f + imbalance;
+}
+
+// ============================================================================
+// Asymmetric Loss Implementation
+// ============================================================================
+
+Float AsymmetricLoss::compute_loss(const Float* labels, const Float* predictions, Index n) const {
+    Float loss = 0.0f;
+
+    #pragma omp parallel for reduction(+:loss)
+    for (Index i = 0; i < n; ++i) {
+        Float p = sigmoid(predictions[i]);
+        Float y = labels[i];
+        p = std::max(1e-7f, std::min(1.0f - 1e-7f, p));
+
+        // Asymmetric weighted cross-entropy
+        // alpha weight for positive class (FN penalty)
+        // (1-alpha) weight for negative class (FP penalty)
+        Float pos_loss = -alpha_ * y * std::log(p);
+        Float neg_loss = -(1.0f - alpha_) * (1.0f - y) * std::log(1.0f - p);
+
+        // Apply focal modulation if gamma > 0
+        if (gamma_pos_ > 0 && y > 0.5f) {
+            pos_loss *= std::pow(1.0f - p, gamma_pos_);
+        }
+        if (gamma_neg_ > 0 && y < 0.5f) {
+            neg_loss *= std::pow(p, gamma_neg_);
+        }
+
+        loss += pos_loss + neg_loss;
+    }
+
+    return loss / n;
+}
+
+void AsymmetricLoss::compute_gradients(
+    const Float* labels,
+    const Float* predictions,
+    Float* gradients,
+    Float* hessians,
+    Index n
+) const {
+    #pragma omp parallel for
+    for (Index i = 0; i < n; ++i) {
+        Float raw = predictions[i];
+        Float p = sigmoid(raw);
+        Float y = labels[i];
+
+        // Gradient for asymmetric loss
+        // d/dz [-alpha*y*log(p) - (1-alpha)*(1-y)*log(1-p)]
+        // = alpha*y*(p-1) + (1-alpha)*(1-y)*p  (using d/dz log(sigmoid(z)) = 1 - sigmoid(z))
+        // Simplified: alpha*(p-y) for positive, (1-alpha)*(p-y) for negative
+        // = p - y weighted by alpha or (1-alpha)
+
+        Float weight = (y > 0.5f) ? alpha_ : (1.0f - alpha_);
+
+        // Apply focal modulation to gradient
+        Float focal_weight = 1.0f;
+        if (y > 0.5f && gamma_pos_ > 0) {
+            focal_weight = std::pow(1.0f - p, gamma_pos_);
+        } else if (y < 0.5f && gamma_neg_ > 0) {
+            focal_weight = std::pow(p, gamma_neg_);
+        }
+
+        gradients[i] = weight * focal_weight * (p - y);
+        hessians[i] = std::max(weight * focal_weight * p * (1.0f - p), 1e-6f);
+    }
+}
+
+Float AsymmetricLoss::transform_prediction(Float raw) const {
+    return sigmoid(raw);
+}
+
+Float AsymmetricLoss::init_prediction(const Float* labels, Index n) const {
+    Float sum = 0.0f;
+    for (Index i = 0; i < n; ++i) {
+        sum += labels[i];
+    }
+    Float p = sum / n;
+    p = std::max(1e-7f, std::min(1.0f - 1e-7f, p));
+    return std::log(p / (1.0f - p));
+}
+
+// ============================================================================
+// AUC Loss Implementation (Pairwise Ranking)
+// ============================================================================
+
+void AUCLoss::update_indices(const Float* labels, Index n) const {
+    pos_indices_.clear();
+    neg_indices_.clear();
+
+    for (Index i = 0; i < n; ++i) {
+        if (labels[i] > 0.5f) {
+            pos_indices_.push_back(i);
+        } else {
+            neg_indices_.push_back(i);
+        }
+    }
+}
+
+Float AUCLoss::compute_loss(const Float* labels, const Float* predictions, Index n) const {
+    update_indices(labels, n);
+
+    if (pos_indices_.empty() || neg_indices_.empty()) {
+        return 0.0f;  // Can't compute pairwise loss without both classes
+    }
+
+    Float loss = 0.0f;
+    Index n_pairs = 0;
+
+    // Sample pairs for efficiency (max 10000 pairs)
+    Index max_pairs = std::min(static_cast<Index>(10000),
+                               static_cast<Index>(pos_indices_.size() * neg_indices_.size()));
+    Index step_pos = std::max(1u, static_cast<Index>(pos_indices_.size() * neg_indices_.size() / max_pairs));
+
+    for (Index pi = 0; pi < pos_indices_.size(); pi += step_pos) {
+        Index i = pos_indices_[pi];
+        Float s_pos = predictions[i];
+
+        for (Index nj = 0; nj < neg_indices_.size(); nj += step_pos) {
+            Index j = neg_indices_[nj];
+            Float s_neg = predictions[j];
+
+            // Pairwise logistic loss: log(1 + exp(-(s_pos - s_neg - margin)))
+            Float diff = s_pos - s_neg - margin_;
+            loss += std::log(1.0f + std::exp(-diff));
+            n_pairs++;
+        }
+    }
+
+    return (n_pairs > 0) ? loss / n_pairs : 0.0f;
+}
+
+void AUCLoss::compute_gradients(
+    const Float* labels,
+    const Float* predictions,
+    Float* gradients,
+    Float* hessians,
+    Index n
+) const {
+    update_indices(labels, n);
+
+    // Initialize gradients and hessians
+    std::fill(gradients, gradients + n, 0.0f);
+    std::fill(hessians, hessians + n, 1e-6f);
+
+    if (pos_indices_.empty() || neg_indices_.empty()) {
+        return;
+    }
+
+    // For each positive-negative pair, compute gradients
+    // Loss for pair (i,j): log(1 + exp(-(s_i - s_j)))
+    // dL/ds_i = -sigma(-(s_i - s_j)) = -(1 - sigma(s_i - s_j))
+    // dL/ds_j = sigma(-(s_i - s_j)) = 1 - sigma(s_i - s_j)
+
+    Index max_pairs = std::min(static_cast<Index>(5000),
+                               static_cast<Index>(pos_indices_.size() * neg_indices_.size()));
+    Index step = std::max(1u, static_cast<Index>(pos_indices_.size() * neg_indices_.size() / max_pairs));
+
+    std::vector<Float> grad_accum(n, 0.0f);
+    std::vector<Index> pair_counts(n, 0);
+
+    for (Index pi = 0; pi < pos_indices_.size(); pi += step) {
+        Index i = pos_indices_[pi];
+        Float s_pos = predictions[i];
+
+        for (Index nj = 0; nj < neg_indices_.size(); nj += step) {
+            Index j = neg_indices_[nj];
+            Float s_neg = predictions[j];
+
+            Float diff = s_pos - s_neg - margin_;
+            Float sig = sigmoid(diff);
+
+            // Gradient: want to increase s_pos and decrease s_neg
+            grad_accum[i] += -(1.0f - sig);  // Negative gradient for pos (minimize loss)
+            grad_accum[j] += (1.0f - sig);   // Positive gradient for neg
+
+            pair_counts[i]++;
+            pair_counts[j]++;
+        }
+    }
+
+    // Normalize and set gradients
+    for (Index i = 0; i < n; ++i) {
+        if (pair_counts[i] > 0) {
+            gradients[i] = grad_accum[i] / pair_counts[i];
+            // Hessian approximation
+            Float p = sigmoid(predictions[i]);
+            hessians[i] = std::max(p * (1.0f - p), 1e-6f);
+        }
+    }
+}
+
+Float AUCLoss::transform_prediction(Float raw) const {
+    return sigmoid(raw);
+}
+
+Float AUCLoss::init_prediction(const Float* labels, Index n) const {
+    return 0.0f;  // Start from zero
+}
+
+// ============================================================================
+// Class-Balanced Loss Implementation
+// ============================================================================
+
+void ClassBalancedLoss::set_class_counts(Index pos_count, Index neg_count) {
+    // Effective number of samples: E_n = (1 - beta^n) / (1 - beta)
+    Float E_pos = (1.0f - std::pow(beta_, static_cast<Float>(pos_count))) / (1.0f - beta_);
+    Float E_neg = (1.0f - std::pow(beta_, static_cast<Float>(neg_count))) / (1.0f - beta_);
+
+    // Weights inversely proportional to effective number
+    Float total = E_pos + E_neg;
+    pos_weight_ = total / (2.0f * E_pos);
+    neg_weight_ = total / (2.0f * E_neg);
+}
+
+void ClassBalancedLoss::set_weights(Float pos_weight, Float neg_weight) {
+    pos_weight_ = pos_weight;
+    neg_weight_ = neg_weight;
+}
+
+Float ClassBalancedLoss::compute_loss(const Float* labels, const Float* predictions, Index n) const {
+    Float loss = 0.0f;
+
+    #pragma omp parallel for reduction(+:loss)
+    for (Index i = 0; i < n; ++i) {
+        Float p = sigmoid(predictions[i]);
+        Float y = labels[i];
+        p = std::max(1e-7f, std::min(1.0f - 1e-7f, p));
+
+        Float weight = (y > 0.5f) ? pos_weight_ : neg_weight_;
+        loss += weight * (-y * std::log(p) - (1.0f - y) * std::log(1.0f - p));
+    }
+
+    return loss / n;
+}
+
+void ClassBalancedLoss::compute_gradients(
+    const Float* labels,
+    const Float* predictions,
+    Float* gradients,
+    Float* hessians,
+    Index n
+) const {
+    #pragma omp parallel for
+    for (Index i = 0; i < n; ++i) {
+        Float p = sigmoid(predictions[i]);
+        Float y = labels[i];
+
+        Float weight = (y > 0.5f) ? pos_weight_ : neg_weight_;
+
+        gradients[i] = weight * (p - y);
+        hessians[i] = std::max(weight * p * (1.0f - p), 1e-6f);
+    }
+}
+
+Float ClassBalancedLoss::transform_prediction(Float raw) const {
+    return sigmoid(raw);
+}
+
+Float ClassBalancedLoss::init_prediction(const Float* labels, Index n) const {
+    Float sum = 0.0f;
+    for (Index i = 0; i < n; ++i) {
+        sum += labels[i];
+    }
+    Float p = sum / n;
+    p = std::max(1e-7f, std::min(1.0f - 1e-7f, p));
+    return std::log(p / (1.0f - p));
+}
+
+// ============================================================================
+// PR-AUC Loss Implementation
+// ============================================================================
+
+Float PRAUCLoss::compute_loss(const Float* labels, const Float* predictions, Index n) const {
+    // Similar to AUC loss but weights pairs by precision at each threshold
+    std::vector<Index> pos_indices, neg_indices;
+
+    for (Index i = 0; i < n; ++i) {
+        if (labels[i] > 0.5f) {
+            pos_indices.push_back(i);
+        } else {
+            neg_indices.push_back(i);
+        }
+    }
+
+    if (pos_indices.empty() || neg_indices.empty()) {
+        return 0.0f;
+    }
+
+    Float loss = 0.0f;
+    Index n_pairs = 0;
+
+    // Weight by inverse of negative count (emphasize precision)
+    Float neg_weight = 1.0f / std::max(1.0f, static_cast<Float>(neg_indices.size()));
+
+    Index max_pairs = std::min(static_cast<Index>(5000),
+                               static_cast<Index>(pos_indices.size() * neg_indices.size()));
+    Index step = std::max(1u, static_cast<Index>(pos_indices.size() * neg_indices.size() / max_pairs));
+
+    for (Index pi = 0; pi < pos_indices.size(); pi += step) {
+        Index i = pos_indices[pi];
+        Float s_pos = predictions[i];
+
+        for (Index nj = 0; nj < neg_indices.size(); nj += step) {
+            Index j = neg_indices[nj];
+            Float s_neg = predictions[j];
+
+            // Higher weight for violations (neg ranked higher than pos)
+            Float diff = s_pos - s_neg - margin_;
+            Float pair_loss = std::log(1.0f + std::exp(-diff));
+
+            // Weight by position to emphasize precision
+            loss += neg_weight * pair_loss;
+            n_pairs++;
+        }
+    }
+
+    return (n_pairs > 0) ? loss / n_pairs : 0.0f;
+}
+
+void PRAUCLoss::compute_gradients(
+    const Float* labels,
+    const Float* predictions,
+    Float* gradients,
+    Float* hessians,
+    Index n
+) const {
+    std::vector<Index> pos_indices, neg_indices;
+
+    for (Index i = 0; i < n; ++i) {
+        if (labels[i] > 0.5f) {
+            pos_indices.push_back(i);
+        } else {
+            neg_indices.push_back(i);
+        }
+    }
+
+    std::fill(gradients, gradients + n, 0.0f);
+    std::fill(hessians, hessians + n, 1e-6f);
+
+    if (pos_indices.empty() || neg_indices.empty()) {
+        return;
+    }
+
+    Float neg_weight = 1.0f / std::max(1.0f, static_cast<Float>(neg_indices.size()));
+
+    std::vector<Float> grad_accum(n, 0.0f);
+    std::vector<Index> pair_counts(n, 0);
+
+    Index max_pairs = std::min(static_cast<Index>(5000),
+                               static_cast<Index>(pos_indices.size() * neg_indices.size()));
+    Index step = std::max(1u, static_cast<Index>(pos_indices.size() * neg_indices.size() / max_pairs));
+
+    for (Index pi = 0; pi < pos_indices.size(); pi += step) {
+        Index i = pos_indices[pi];
+        Float s_pos = predictions[i];
+
+        for (Index nj = 0; nj < neg_indices.size(); nj += step) {
+            Index j = neg_indices[nj];
+            Float s_neg = predictions[j];
+
+            Float diff = s_pos - s_neg - margin_;
+            Float sig = sigmoid(diff);
+
+            // Weighted gradients
+            grad_accum[i] += neg_weight * (-(1.0f - sig));
+            grad_accum[j] += neg_weight * (1.0f - sig);
+
+            pair_counts[i]++;
+            pair_counts[j]++;
+        }
+    }
+
+    for (Index i = 0; i < n; ++i) {
+        if (pair_counts[i] > 0) {
+            gradients[i] = grad_accum[i] / pair_counts[i];
+            Float p = sigmoid(predictions[i]);
+            hessians[i] = std::max(p * (1.0f - p), 1e-6f);
+        }
+    }
+}
+
+Float PRAUCLoss::transform_prediction(Float raw) const {
+    return sigmoid(raw);
+}
+
+Float PRAUCLoss::init_prediction(const Float* labels, Index n) const {
+    return 0.0f;
 }
 
 } // namespace turbocat

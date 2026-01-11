@@ -279,7 +279,31 @@ void LeafWiseTree::make_leaf(TreeIndex node_idx, const GradientPair& stats) {
 }
 
 Float LeafWiseTree::compute_leaf_value(const GradientPair& stats) const {
-    return -stats.grad / (stats.hess + config_.lambda_l2);
+    // Newton's method optimal leaf value with L2 regularization
+    // For squared loss: optimal = -grad / (hess + lambda)
+    // For other losses: this is a Newton step which is approximately optimal
+
+    Float raw_value = -stats.grad / (stats.hess + config_.lambda_l2);
+
+    // Apply L1 regularization (soft thresholding)
+    if (config_.lambda_l1 > 0.0f) {
+        Float abs_raw = std::abs(raw_value);
+        if (abs_raw <= config_.lambda_l1 / (stats.hess + config_.lambda_l2)) {
+            raw_value = 0.0f;
+        } else {
+            Float sign = (raw_value > 0) ? 1.0f : -1.0f;
+            raw_value = sign * (abs_raw - config_.lambda_l1 / (stats.hess + config_.lambda_l2));
+        }
+    }
+
+    // Apply leaf smoothing (shrinkage based on sample count)
+    // This is CatBoost-style: smaller leaves get shrunk more
+    if (config_.leaf_smooth > 0.0f && stats.count > 0) {
+        Float shrink = static_cast<Float>(stats.count) / (stats.count + config_.leaf_smooth);
+        raw_value *= shrink;
+    }
+
+    return raw_value;
 }
 
 SplitInfo LeafWiseTree::find_best_split(

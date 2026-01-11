@@ -213,6 +213,7 @@ struct FeatureInfo {
     Float min_value;
     Float max_value;
     bool has_missing;
+    uint32_t cardinality = 0;            // For categorical: number of unique values
     std::vector<Float> bin_edges;        // For numerical
     std::vector<Index> category_counts;  // For categorical
 };
@@ -256,12 +257,18 @@ enum class LossType : uint8_t {
     MSE = 2,
     MAE = 3,
     Huber = 4,
-    
+
     // Advanced losses (our innovations)
     RobustFocal = 10,      // Robust to label noise
     LDAM = 11,             // Label-distribution-aware margin loss
     LogitAdjusted = 12,    // Class-imbalance aware
     Tsallis = 13,          // Generalized entropy loss
+
+    // New: Metric-optimizing losses
+    Asymmetric = 20,       // Control recall/precision tradeoff
+    AUCLoss = 21,          // Pairwise ranking loss for AUC optimization
+    ClassBalanced = 22,    // Inverse frequency weighted loss
+    PRAUCLoss = 23,        // Optimizes PR-AUC directly
 };
 
 // ============================================================================

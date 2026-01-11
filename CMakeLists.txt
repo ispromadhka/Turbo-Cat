@@ -140,11 +140,16 @@ set(TURBOCAT_CORE_SOURCES
     src/tree/tree.cpp
     src/tree/flat_tree.cpp
     src/tree/fast_ensemble.cpp
+    src/tree/fast_float_ensemble.cpp
     src/tree/symmetric_tree.cpp
     src/tree/leaf_wise_tree.cpp
     src/tree/gradtree.cpp
+    src/tree/feature_bundler.cpp
+    src/tree/feature_orderings.cpp
     src/boosting/loss.cpp
     src/boosting/booster.cpp
+    src/metrics/metrics.cpp
+    src/preprocessing/interactions.cpp
     src/utils/simd.cpp
     src/utils/threading.cpp
 )

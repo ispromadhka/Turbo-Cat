@@ -7,13 +7,20 @@
 
 #include "turbocat/symmetric_tree.hpp"
 #include "turbocat/fast_ensemble.hpp"
+#include "turbocat/fast_float_ensemble.hpp"
+#include "turbocat/feature_orderings.hpp"
 #include <algorithm>
 #include <numeric>
 #include <cstring>
 #include <cmath>
+#include <fstream>
 
 #ifdef _OPENMP
 #include <omp.h>
+#endif
+
+#ifdef TURBOCAT_AVX2
+#include <immintrin.h>
 #endif
 
 namespace turbocat {
@@ -37,7 +44,8 @@ void SymmetricTree::build(
 
     const Float* grads = dataset.gradients();
     const Float* hess = dataset.hessians();
-    FeatureIndex n_features = dataset.n_features();
+    const FeatureIndex n_features = dataset.n_features();
+    const BinIndex max_bins = config_.max_bins;
 
     // Initialize: all samples in one node (root)
     std::vector<std::vector<Index>> current_level_samples(1);
@@ -49,6 +57,9 @@ void SymmetricTree::build(
         current_level_stats[0].hess += hess[idx];
         current_level_stats[0].count += 1;
     }
+
+    // Keep histograms across levels for HISTOGRAM SUBTRACTION TRICK
+    std::vector<Histogram> current_level_histograms;
 
     splits_.clear();
     depth_ = 0;
@@ -69,9 +80,22 @@ void SymmetricTree::build(
         if (should_stop) break;
 
         // Find best split for this level (ONE split for ALL nodes)
-        SymmetricSplit best_split = find_best_level_split(
-            dataset, current_level_samples, current_level_stats, hist_builder
-        );
+        // If histograms were pre-built via subtraction, use them directly
+        SymmetricSplit best_split;
+        bool histograms_prebuilt = (current_level_histograms.size() == n_nodes) &&
+                                   (d > 0);  // After first level, histograms are pre-built
+        if (histograms_prebuilt) {
+            // Histograms already built via subtraction, just find best split
+            best_split = find_best_split_from_histograms(
+                dataset, current_level_histograms, current_level_stats
+            );
+        } else {
+            // Build histograms and find best split
+            best_split = find_best_level_split_with_histograms(
+                dataset, current_level_samples, current_level_stats, hist_builder,
+                current_level_histograms
+            );
+        }
 
         // Check if split is valid
         if (best_split.gain < config_.min_split_gain) {
@@ -82,37 +106,36 @@ void SymmetricTree::build(
         splits_.push_back(best_split);
         depth_ = d + 1;
 
-        // Create next level
+        // Create next level with HISTOGRAM SUBTRACTION
         uint32_t next_n_nodes = n_nodes * 2;
         std::vector<std::vector<Index>> next_level_samples(next_n_nodes);
         std::vector<GradientPair> next_level_stats(next_n_nodes);
+        std::vector<Histogram> next_level_histograms(next_n_nodes, Histogram(n_features, max_bins));
 
-        // Pre-allocate
+        // Pre-allocate based on expected distribution
+        size_t expected_per_node = sample_indices.size() / next_n_nodes + 100;
         for (uint32_t n = 0; n < next_n_nodes; ++n) {
-            next_level_samples[n].reserve(sample_indices.size() / next_n_nodes + 100);
+            next_level_samples[n].reserve(expected_per_node);
         }
 
         const BinIndex* split_bins = dataset.binned().column(best_split.feature);
         const BinIndex threshold = best_split.threshold;
 
-        // Partition samples for each node - parallel across nodes (no data races)
+        // Partition samples
         #pragma omp parallel for schedule(dynamic)
         for (uint32_t n = 0; n < n_nodes; ++n) {
             uint32_t left_child = n * 2;
             uint32_t right_child = n * 2 + 1;
 
-            // Each node's children are unique, no need for critical section
             for (Index idx : current_level_samples[n]) {
                 BinIndex bin = split_bins[idx];
 
                 if (bin == 255 || bin <= threshold) {
-                    // Go left
                     next_level_samples[left_child].push_back(idx);
                     next_level_stats[left_child].grad += grads[idx];
                     next_level_stats[left_child].hess += hess[idx];
                     next_level_stats[left_child].count += 1;
                 } else {
-                    // Go right
                     next_level_samples[right_child].push_back(idx);
                     next_level_stats[right_child].grad += grads[idx];
                     next_level_stats[right_child].hess += hess[idx];
@@ -121,8 +144,42 @@ void SymmetricTree::build(
             }
         }
 
+        // HISTOGRAM SUBTRACTION TRICK: Build smaller child, compute larger via subtraction
+        // This saves ~50% of histogram building at deeper levels
+        #pragma omp parallel for schedule(dynamic)
+        for (uint32_t n = 0; n < n_nodes; ++n) {
+            uint32_t left_child = n * 2;
+            uint32_t right_child = n * 2 + 1;
+
+            // Determine which child is smaller
+            bool left_is_smaller = next_level_samples[left_child].size() <=
+                                   next_level_samples[right_child].size();
+            uint32_t smaller = left_is_smaller ? left_child : right_child;
+            uint32_t larger = left_is_smaller ? right_child : left_child;
+
+            // Build histogram for smaller child only
+            if (!next_level_samples[smaller].empty()) {
+                hist_builder.build(dataset, next_level_samples[smaller], {},
+                                   next_level_histograms[smaller]);
+            }
+
+            // Compute larger child via subtraction: larger = parent - smaller
+            for (FeatureIndex f = 0; f < n_features; ++f) {
+                const GradientPair* parent_hist = current_level_histograms[n].bins(f);
+                const GradientPair* smaller_hist = next_level_histograms[smaller].bins(f);
+                GradientPair* larger_hist = next_level_histograms[larger].bins(f);
+
+                for (BinIndex b = 0; b < max_bins; ++b) {
+                    larger_hist[b].grad = parent_hist[b].grad - smaller_hist[b].grad;
+                    larger_hist[b].hess = parent_hist[b].hess - smaller_hist[b].hess;
+                    larger_hist[b].count = parent_hist[b].count - smaller_hist[b].count;
+                }
+            }
+        }
+
         current_level_samples = std::move(next_level_samples);
         current_level_stats = std::move(next_level_stats);
+        current_level_histograms = std::move(next_level_histograms);
     }
 
     // Compute leaf values
@@ -138,78 +195,127 @@ void SymmetricTree::build(
     }
 }
 
-SymmetricSplit SymmetricTree::find_best_level_split(
+SymmetricSplit SymmetricTree::find_best_level_split_with_histograms(
     const Dataset& dataset,
     const std::vector<std::vector<Index>>& node_samples,
     const std::vector<GradientPair>& node_stats,
-    HistogramBuilder& hist_builder
+    HistogramBuilder& hist_builder,
+    std::vector<Histogram>& out_histograms
 ) {
-    FeatureIndex n_features = dataset.n_features();
-    BinIndex max_bins = config_.max_bins;
-    Float lambda = config_.lambda_l2;
+    // Same as find_best_level_split but outputs histograms for reuse
+    const FeatureIndex n_features = dataset.n_features();
+    const BinIndex max_bins = config_.max_bins;
+    const Float lambda = config_.lambda_l2;
+    const uint32_t n_nodes = static_cast<uint32_t>(node_samples.size());
+    const Index n_samples = dataset.n_samples();
 
-    uint32_t n_nodes = static_cast<uint32_t>(node_samples.size());
+    // Resize output histograms if needed
+    out_histograms.resize(n_nodes, Histogram(n_features, max_bins));
+    for (auto& h : out_histograms) {
+        h.clear();
+    }
 
-    // CORRECT APPROACH: Build histogram for EACH node, sum gains across nodes
-    // This is how CatBoost actually does it for oblivious trees
+    // OPTIMIZATION: Use pre-sorted feature orderings if available
+    if (dataset.has_orderings()) {
+        // Build sample_to_node mapping
+        std::vector<int32_t> sample_to_node(n_samples, -1);
+        for (uint32_t n = 0; n < n_nodes; ++n) {
+            for (Index idx : node_samples[n]) {
+                sample_to_node[idx] = static_cast<int32_t>(n);
+            }
+        }
 
-    // Build per-node histograms
-    std::vector<Histogram> node_histograms(n_nodes, Histogram(n_features, max_bins));
+        const FeatureOrderings& orderings = dataset.orderings();
+        const Float* grads = dataset.gradients();
+        const Float* hess = dataset.hessians();
 
-    #pragma omp parallel for schedule(dynamic)
-    for (uint32_t n = 0; n < n_nodes; ++n) {
-        if (!node_samples[n].empty()) {
-            hist_builder.build(dataset, node_samples[n], {}, node_histograms[n]);
+        // Build histograms directly without intermediate allocation
+        // Each thread processes a subset of features
+        #pragma omp parallel for schedule(static)
+        for (FeatureIndex f = 0; f < n_features; ++f) {
+            const BinIndex* bins = dataset.binned().column(f);
+            const auto& sorted_idx = orderings.sorted_indices(f);
+
+            // Iterate through samples in sorted order for this feature
+            for (Index pos = 0; pos < n_samples; ++pos) {
+                Index idx = sorted_idx[pos];
+                int32_t node = sample_to_node[idx];
+
+                if (node >= 0) {
+                    BinIndex bin = bins[idx];
+                    GradientPair* hist = out_histograms[node].bins(f);
+                    hist[bin].grad += grads[idx];
+                    hist[bin].hess += hess[idx];
+                    hist[bin].count += 1;
+                }
+            }
+        }
+    } else {
+        // Fallback to original histogram building
+        if (n_nodes == 1) {
+            if (!node_samples[0].empty()) {
+                hist_builder.build(dataset, node_samples[0], {}, out_histograms[0]);
+            }
+        } else {
+            #pragma omp parallel for schedule(dynamic)
+            for (uint32_t n = 0; n < n_nodes; ++n) {
+                if (!node_samples[n].empty()) {
+                    hist_builder.build(dataset, node_samples[n], {}, out_histograms[n]);
+                }
+            }
         }
     }
 
-    // Find best split by summing gains across all nodes
-    SymmetricSplit best_split;
-    best_split.gain = -1e30f;
+    // Find best split (same logic as find_best_level_split)
+    std::vector<Float> parent_gains(n_nodes);
+    for (uint32_t n = 0; n < n_nodes; ++n) {
+        if (node_stats[n].count > 0 && node_stats[n].hess > 1e-10f) {
+            parent_gains[n] = (node_stats[n].grad * node_stats[n].grad) / (node_stats[n].hess + lambda);
+        }
+    }
 
-    // Parallel search over features
+    int max_threads = 1;
+    #ifdef _OPENMP
+    max_threads = omp_get_max_threads();
+    #endif
+
+    std::vector<SymmetricSplit> thread_best(max_threads);
+    for (int t = 0; t < max_threads; ++t) {
+        thread_best[t].gain = -1e30f;
+    }
+
     #pragma omp parallel
     {
-        SymmetricSplit local_best;
-        local_best.gain = -1e30f;
+        int tid = 0;
+        #ifdef _OPENMP
+        tid = omp_get_thread_num();
+        #endif
 
-        // Pre-allocate per-thread vector to avoid repeated allocations
+        SymmetricSplit& local_best = thread_best[tid];
         std::vector<GradientPair> node_left_sums(n_nodes);
 
         #pragma omp for nowait schedule(static)
         for (FeatureIndex f = 0; f < n_features; ++f) {
-            // Reset cumulative sums for this feature (faster than reallocating)
             std::memset(node_left_sums.data(), 0, n_nodes * sizeof(GradientPair));
 
             for (BinIndex b = 0; b < max_bins - 1; ++b) {
-                // Update cumulative sums for each node
                 Float total_gain = 0.0f;
-                bool valid_split = true;
 
                 for (uint32_t n = 0; n < n_nodes; ++n) {
-                    node_left_sums[n] += node_histograms[n].bins(f)[b];
-                    GradientPair left_sum = node_left_sums[n];
-                    GradientPair right_sum = node_stats[n] - left_sum;
+                    node_left_sums[n] += out_histograms[n].bins(f)[b];
 
-                    // Skip if this node has no samples
-                    if (node_stats[n].count == 0) {
-                        continue;
-                    }
+                    if (node_stats[n].count == 0) continue;
 
-                    // Check constraints per node
-                    if (left_sum.hess < 1e-10f || right_sum.hess < 1e-10f) {
-                        // This split creates empty children for this node
-                        // Still allow the split, just don't add gain for this node
-                        continue;
-                    }
+                    const GradientPair& left = node_left_sums[n];
+                    GradientPair right;
+                    right.grad = node_stats[n].grad - left.grad;
+                    right.hess = node_stats[n].hess - left.hess;
 
-                    // Compute gain for this node
-                    Float left_gain = (left_sum.grad * left_sum.grad) / (left_sum.hess + lambda);
-                    Float right_gain = (right_sum.grad * right_sum.grad) / (right_sum.hess + lambda);
-                    Float parent_gain = (node_stats[n].grad * node_stats[n].grad) / (node_stats[n].hess + lambda);
+                    if (left.hess < 1e-10f || right.hess < 1e-10f) continue;
 
-                    Float node_gain = 0.5f * (left_gain + right_gain - parent_gain);
-                    total_gain += node_gain;
+                    Float left_gain = (left.grad * left.grad) / (left.hess + lambda);
+                    Float right_gain = (right.grad * right.grad) / (right.hess + lambda);
+                    total_gain += 0.5f * (left_gain + right_gain - parent_gains[n]);
                 }
 
                 if (total_gain > local_best.gain) {
@@ -219,12 +325,286 @@ SymmetricSplit SymmetricTree::find_best_level_split(
                 }
             }
         }
+    }
 
-        #pragma omp critical
-        {
-            if (local_best.gain > best_split.gain) {
-                best_split = local_best;
+    SymmetricSplit best_split;
+    best_split.gain = -1e30f;
+    for (int t = 0; t < max_threads; ++t) {
+        if (thread_best[t].gain > best_split.gain) {
+            best_split = thread_best[t];
+        }
+    }
+
+    // Look up float threshold
+    const auto& bin_edges = dataset.bin_edges();
+    if (best_split.gain > -1e29f && best_split.feature < bin_edges.size()) {
+        const auto& edges = bin_edges[best_split.feature];
+        if (best_split.threshold < edges.size()) {
+            best_split.float_threshold = edges[best_split.threshold];
+        } else if (!edges.empty()) {
+            best_split.float_threshold = edges.back();
+        }
+    }
+
+    return best_split;
+}
+
+SymmetricSplit SymmetricTree::find_best_level_split(
+    const Dataset& dataset,
+    const std::vector<std::vector<Index>>& node_samples,
+    const std::vector<GradientPair>& node_stats,
+    HistogramBuilder& hist_builder
+) {
+    const FeatureIndex n_features = dataset.n_features();
+    const BinIndex max_bins = config_.max_bins;
+    const Float lambda = config_.lambda_l2;
+    const uint32_t n_nodes = static_cast<uint32_t>(node_samples.size());
+    const Index n_samples = dataset.n_samples();
+
+    std::vector<Histogram> node_histograms(n_nodes, Histogram(n_features, max_bins));
+
+    // OPTIMIZATION: Use pre-sorted feature orderings if available
+    if (dataset.has_orderings()) {
+        // Build sample_to_node mapping
+        std::vector<int32_t> sample_to_node(n_samples, -1);
+        for (uint32_t n = 0; n < n_nodes; ++n) {
+            for (Index idx : node_samples[n]) {
+                sample_to_node[idx] = static_cast<int32_t>(n);
             }
+        }
+
+        // Use OrderedHistogramBuilder for sequential memory access
+        OrderedHistogramBuilder ordered_builder;
+        const FeatureOrderings& orderings = dataset.orderings();
+
+        // Build histograms for all features in parallel, all nodes at once per feature
+        #pragma omp parallel for schedule(static)
+        for (FeatureIndex f = 0; f < n_features; ++f) {
+            std::vector<GradientPair> feature_hists;
+            ordered_builder.build_for_nodes(
+                dataset, orderings, sample_to_node, n_nodes,
+                f, feature_hists, max_bins
+            );
+
+            // Copy to output histograms
+            for (uint32_t n = 0; n < n_nodes; ++n) {
+                GradientPair* dest = node_histograms[n].bins(f);
+                const GradientPair* src = feature_hists.data() + n * max_bins;
+                std::memcpy(dest, src, max_bins * sizeof(GradientPair));
+            }
+        }
+    } else {
+        // Fallback to original histogram building
+        if (n_nodes == 1) {
+            // Root level: just build the single histogram
+            if (!node_samples[0].empty()) {
+                hist_builder.build(dataset, node_samples[0], {}, node_histograms[0]);
+            }
+        } else {
+            // For deeper levels, build histograms in parallel
+            #pragma omp parallel for schedule(dynamic)
+            for (uint32_t n = 0; n < n_nodes; ++n) {
+                if (!node_samples[n].empty()) {
+                    hist_builder.build(dataset, node_samples[n], {}, node_histograms[n]);
+                }
+            }
+        }
+    }
+
+    // OPTIMIZATION 2: Pre-compute parent gains (constant across all splits)
+    std::vector<Float> parent_gains(n_nodes);
+    for (uint32_t n = 0; n < n_nodes; ++n) {
+        if (node_stats[n].count > 0 && node_stats[n].hess > 1e-10f) {
+            parent_gains[n] = (node_stats[n].grad * node_stats[n].grad) / (node_stats[n].hess + lambda);
+        } else {
+            parent_gains[n] = 0.0f;
+        }
+    }
+
+    // OPTIMIZATION 3: Lock-free split finding with array-based reduction
+    int max_threads = 1;
+    #ifdef _OPENMP
+    max_threads = omp_get_max_threads();
+    #endif
+
+    std::vector<SymmetricSplit> thread_best(max_threads);
+    for (int t = 0; t < max_threads; ++t) {
+        thread_best[t].gain = -1e30f;
+    }
+
+    #pragma omp parallel
+    {
+        int tid = 0;
+        #ifdef _OPENMP
+        tid = omp_get_thread_num();
+        #endif
+
+        SymmetricSplit& local_best = thread_best[tid];
+
+        // Pre-allocate per-thread vector
+        std::vector<GradientPair> node_left_sums(n_nodes);
+
+        #pragma omp for nowait schedule(static)
+        for (FeatureIndex f = 0; f < n_features; ++f) {
+            // Reset cumulative sums
+            std::memset(node_left_sums.data(), 0, n_nodes * sizeof(GradientPair));
+
+            // Scan through bins
+            for (BinIndex b = 0; b < max_bins - 1; ++b) {
+                Float total_gain = 0.0f;
+
+                // OPTIMIZATION 4: Unroll loop for small n_nodes (common case)
+                if (n_nodes == 1) {
+                    node_left_sums[0] += node_histograms[0].bins(f)[b];
+                    const GradientPair& left = node_left_sums[0];
+                    GradientPair right;
+                    right.grad = node_stats[0].grad - left.grad;
+                    right.hess = node_stats[0].hess - left.hess;
+
+                    if (left.hess >= 1e-10f && right.hess >= 1e-10f) {
+                        Float left_gain = (left.grad * left.grad) / (left.hess + lambda);
+                        Float right_gain = (right.grad * right.grad) / (right.hess + lambda);
+                        total_gain = 0.5f * (left_gain + right_gain - parent_gains[0]);
+                    }
+                } else {
+                    for (uint32_t n = 0; n < n_nodes; ++n) {
+                        node_left_sums[n] += node_histograms[n].bins(f)[b];
+
+                        if (node_stats[n].count == 0) continue;
+
+                        const GradientPair& left = node_left_sums[n];
+                        GradientPair right;
+                        right.grad = node_stats[n].grad - left.grad;
+                        right.hess = node_stats[n].hess - left.hess;
+
+                        if (left.hess < 1e-10f || right.hess < 1e-10f) continue;
+
+                        Float left_gain = (left.grad * left.grad) / (left.hess + lambda);
+                        Float right_gain = (right.grad * right.grad) / (right.hess + lambda);
+                        total_gain += 0.5f * (left_gain + right_gain - parent_gains[n]);
+                    }
+                }
+
+                if (total_gain > local_best.gain) {
+                    local_best.feature = f;
+                    local_best.threshold = b;
+                    local_best.gain = total_gain;
+                }
+            }
+        }
+    }
+
+    // Final reduction (O(num_threads) - very fast)
+    SymmetricSplit best_split;
+    best_split.gain = -1e30f;
+    for (int t = 0; t < max_threads; ++t) {
+        if (thread_best[t].gain > best_split.gain) {
+            best_split = thread_best[t];
+        }
+    }
+
+    // Look up float threshold from bin edges
+    const auto& bin_edges = dataset.bin_edges();
+    if (best_split.gain > -1e29f && best_split.feature < bin_edges.size()) {
+        const auto& edges = bin_edges[best_split.feature];
+        if (best_split.threshold < edges.size()) {
+            best_split.float_threshold = edges[best_split.threshold];
+        } else if (!edges.empty()) {
+            best_split.float_threshold = edges.back();
+        }
+    }
+
+    return best_split;
+}
+
+SymmetricSplit SymmetricTree::find_best_split_from_histograms(
+    const Dataset& dataset,
+    const std::vector<Histogram>& histograms,
+    const std::vector<GradientPair>& node_stats
+) {
+    const FeatureIndex n_features = dataset.n_features();
+    const BinIndex max_bins = config_.max_bins;
+    const Float lambda = config_.lambda_l2;
+    const uint32_t n_nodes = static_cast<uint32_t>(histograms.size());
+
+    // Pre-compute parent gains
+    std::vector<Float> parent_gains(n_nodes);
+    for (uint32_t n = 0; n < n_nodes; ++n) {
+        if (node_stats[n].count > 0 && node_stats[n].hess > 1e-10f) {
+            parent_gains[n] = (node_stats[n].grad * node_stats[n].grad) /
+                             (node_stats[n].hess + lambda);
+        }
+    }
+
+    int max_threads = 1;
+    #ifdef _OPENMP
+    max_threads = omp_get_max_threads();
+    #endif
+
+    std::vector<SymmetricSplit> thread_best(max_threads);
+    for (int t = 0; t < max_threads; ++t) {
+        thread_best[t].gain = -1e30f;
+    }
+
+    #pragma omp parallel
+    {
+        int tid = 0;
+        #ifdef _OPENMP
+        tid = omp_get_thread_num();
+        #endif
+
+        SymmetricSplit& local_best = thread_best[tid];
+        std::vector<GradientPair> node_left_sums(n_nodes);
+
+        #pragma omp for nowait schedule(static)
+        for (FeatureIndex f = 0; f < n_features; ++f) {
+            std::memset(node_left_sums.data(), 0, n_nodes * sizeof(GradientPair));
+
+            for (BinIndex b = 0; b < max_bins - 1; ++b) {
+                Float total_gain = 0.0f;
+
+                for (uint32_t n = 0; n < n_nodes; ++n) {
+                    node_left_sums[n] += histograms[n].bins(f)[b];
+                    if (node_stats[n].count == 0) continue;
+
+                    const GradientPair& left = node_left_sums[n];
+                    GradientPair right;
+                    right.grad = node_stats[n].grad - left.grad;
+                    right.hess = node_stats[n].hess - left.hess;
+
+                    if (left.hess < 1e-10f || right.hess < 1e-10f) continue;
+
+                    Float left_gain = (left.grad * left.grad) / (left.hess + lambda);
+                    Float right_gain = (right.grad * right.grad) / (right.hess + lambda);
+                    total_gain += 0.5f * (left_gain + right_gain - parent_gains[n]);
+                }
+
+                if (total_gain > local_best.gain) {
+                    local_best.feature = f;
+                    local_best.threshold = b;
+                    local_best.gain = total_gain;
+                }
+            }
+        }
+    }
+
+    // Final reduction
+    SymmetricSplit best_split;
+    best_split.gain = -1e30f;
+    for (int t = 0; t < max_threads; ++t) {
+        if (thread_best[t].gain > best_split.gain) {
+            best_split = thread_best[t];
+        }
+    }
+
+    // Look up float threshold
+    const auto& bin_edges = dataset.bin_edges();
+    if (best_split.gain > -1e29f && best_split.feature < bin_edges.size()) {
+        const auto& edges = bin_edges[best_split.feature];
+        if (best_split.threshold < edges.size()) {
+            best_split.float_threshold = edges[best_split.threshold];
+        } else if (!edges.empty()) {
+            best_split.float_threshold = edges.back();
         }
     }
 
@@ -320,6 +700,53 @@ void SymmetricTree::predict_batch(const Dataset& dataset, Float* output) const {
     }
 }
 
+Float SymmetricTree::predict_raw(const Float* features, FeatureIndex n_features) const {
+    if (depth_ == 0) {
+        return leaf_values_.empty() ? 0.0f : leaf_values_[0];
+    }
+
+    uint32_t leaf_idx = 0;
+    for (uint16_t d = 0; d < depth_; ++d) {
+        const SymmetricSplit& split = splits_[d];
+        Float val = features[split.feature];
+
+        // NaN goes left (like binned prediction), otherwise compare directly
+        bool go_right = !std::isnan(val) && val > split.float_threshold;
+        leaf_idx = (leaf_idx << 1) | (go_right ? 1u : 0u);
+    }
+
+    return leaf_values_[leaf_idx];
+}
+
+void SymmetricTree::predict_batch_raw(const Float* data, Index n_samples, FeatureIndex n_features, Float* output) const {
+    if (depth_ == 0) {
+        Float val = leaf_values_.empty() ? 0.0f : leaf_values_[0];
+        for (Index i = 0; i < n_samples; ++i) {
+            output[i] = val;
+        }
+        return;
+    }
+
+    // Optimized batch prediction using raw float thresholds
+    // No binning required - direct float comparisons
+    #pragma omp parallel for
+    for (Index i = 0; i < n_samples; ++i) {
+        const Float* row = data + i * n_features;
+        uint32_t leaf_idx = 0;
+
+        for (uint16_t d = 0; d < depth_; ++d) {
+            const SymmetricSplit& split = splits_[d];
+            Float val = row[split.feature];
+
+            // NaN goes left (like binned prediction), otherwise compare directly
+            bool go_right = !std::isnan(val) && val > split.float_threshold;
+            leaf_idx = (leaf_idx << 1) | (go_right ? 1u : 0u);
+        }
+
+        output[i] = leaf_values_[leaf_idx];
+    }
+}
+
 std::vector<Float> SymmetricTree::feature_importance() const {
     std::vector<Float> importance(256, 0.0f);
 
@@ -393,12 +820,191 @@ void SymmetricEnsemble::predict_batch(const Dataset& data, Float* output) const 
     }
 }
 
+void SymmetricEnsemble::predict_batch_raw(const Float* data, Index n_samples, FeatureIndex n_features, Float* output) const {
+    // Raw float prediction - no binning required!
+    // Uses float_threshold for direct comparisons like CatBoost
+    // OPTIMIZED: Process all trees for each sample batch (better cache locality)
+
+    if (trees_.empty()) {
+        std::memset(output, 0, n_samples * sizeof(Float));
+        return;
+    }
+
+    // Pre-extract tree info for faster access
+    const size_t n_trees = trees_.size();
+    const size_t max_depth = 16;  // Maximum depth we support
+
+    // Flatten tree data for faster access
+    std::vector<uint16_t> depths(n_trees);
+    std::vector<Float> weights(n_trees);
+    std::vector<FeatureIndex> features(n_trees * max_depth);
+    std::vector<Float> thresholds(n_trees * max_depth);
+    std::vector<const Float*> leaf_ptrs(n_trees);
+
+    for (size_t t = 0; t < n_trees; ++t) {
+        const SymmetricTree& tree = *trees_[t];
+        depths[t] = tree.depth();
+        weights[t] = tree_weights_[t];
+        leaf_ptrs[t] = tree.leaf_values().data();
+
+        const auto& splits = tree.splits();
+        for (uint16_t d = 0; d < depths[t]; ++d) {
+            features[t * max_depth + d] = splits[d].feature;
+            thresholds[t * max_depth + d] = splits[d].float_threshold;
+        }
+    }
+
+#ifdef TURBOCAT_AVX2
+    // AVX2 SIMD optimized path - process 8 samples at a time
+    Index n_simd = (n_samples / 8) * 8;
+
+    #pragma omp parallel for schedule(static)
+    for (Index base = 0; base < n_simd; base += 8) {
+        __m256 sums = _mm256_setzero_ps();
+
+        for (size_t t = 0; t < n_trees; ++t) {
+            uint16_t depth = depths[t];
+            Float weight = weights[t];
+            const Float* leaves = leaf_ptrs[t];
+
+            if (depth == 0) {
+                sums = _mm256_add_ps(sums, _mm256_set1_ps(weight * leaves[0]));
+                continue;
+            }
+
+            // Compute leaf indices for 8 samples
+            __m256i indices = _mm256_setzero_si256();
+
+            for (uint16_t d = 0; d < depth; ++d) {
+                FeatureIndex feat = features[t * max_depth + d];
+                Float thresh = thresholds[t * max_depth + d];
+
+                // Load 8 feature values (strided access)
+                alignas(32) float vals[8];
+                for (int j = 0; j < 8; ++j) {
+                    vals[j] = data[(base + j) * n_features + feat];
+                }
+                __m256 v_vals = _mm256_load_ps(vals);
+
+                // NaN check: val != val for NaN
+                __m256 v_nan_mask = _mm256_cmp_ps(v_vals, v_vals, _CMP_UNORD_Q);
+
+                // Compare: val > threshold
+                __m256 v_thresh = _mm256_set1_ps(thresh);
+                __m256 v_cmp = _mm256_cmp_ps(v_vals, v_thresh, _CMP_GT_OQ);
+
+                // Go right if not NaN and > threshold
+                __m256 v_go_right = _mm256_andnot_ps(v_nan_mask, v_cmp);
+
+                // Update indices
+                indices = _mm256_slli_epi32(indices, 1);
+                __m256i v_bit = _mm256_and_si256(
+                    _mm256_castps_si256(v_go_right),
+                    _mm256_set1_epi32(1)
+                );
+                indices = _mm256_or_si256(indices, v_bit);
+            }
+
+            // Gather leaf values (scalar - AVX2 gather is slow)
+            alignas(32) uint32_t idx_arr[8];
+            _mm256_store_si256(reinterpret_cast<__m256i*>(idx_arr), indices);
+
+            alignas(32) float leaf_vals[8];
+            for (int j = 0; j < 8; ++j) {
+                leaf_vals[j] = weight * leaves[idx_arr[j]];
+            }
+            sums = _mm256_add_ps(sums, _mm256_load_ps(leaf_vals));
+        }
+
+        _mm256_storeu_ps(output + base, sums);
+    }
+
+    // Handle remaining samples
+    for (Index i = n_simd; i < n_samples; ++i) {
+        Float sum = 0.0f;
+        const Float* row = data + i * n_features;
+
+        for (size_t t = 0; t < n_trees; ++t) {
+            uint16_t depth = depths[t];
+            const Float* leaves = leaf_ptrs[t];
+
+            if (depth == 0) {
+                sum += weights[t] * leaves[0];
+                continue;
+            }
+
+            uint32_t leaf_idx = 0;
+            for (uint16_t d = 0; d < depth; ++d) {
+                Float val = row[features[t * max_depth + d]];
+                bool go_right = !std::isnan(val) && val > thresholds[t * max_depth + d];
+                leaf_idx = (leaf_idx << 1) | (go_right ? 1u : 0u);
+            }
+            sum += weights[t] * leaves[leaf_idx];
+        }
+        output[i] = sum;
+    }
+
+#else
+    // Scalar fallback
+    #pragma omp parallel for
+    for (Index i = 0; i < n_samples; ++i) {
+        Float sum = 0.0f;
+        const Float* row = data + i * n_features;
+
+        for (size_t t = 0; t < n_trees; ++t) {
+            uint16_t depth = depths[t];
+            const Float* leaves = leaf_ptrs[t];
+
+            if (depth == 0) {
+                sum += weights[t] * leaves[0];
+                continue;
+            }
+
+            uint32_t leaf_idx = 0;
+            for (uint16_t d = 0; d < depth; ++d) {
+                Float val = row[features[t * max_depth + d]];
+                bool go_right = !std::isnan(val) && val > thresholds[t * max_depth + d];
+                leaf_idx = (leaf_idx << 1) | (go_right ? 1u : 0u);
+            }
+            sum += weights[t] * leaves[leaf_idx];
+        }
+        output[i] = sum;
+    }
+#endif
+}
+
 void SymmetricEnsemble::prepare_fast_ensemble() const {
     if (fast_prepared_) return;
 
     fast_ensemble_ = std::make_unique<FastEnsemble>();
     fast_ensemble_->from_symmetric_ensemble(*this);
     fast_prepared_ = true;
+}
+
+void SymmetricEnsemble::prepare_fast_float_ensemble() const {
+    if (fast_float_prepared_) return;
+
+    fast_float_ensemble_ = std::make_unique<FastFloatEnsemble>();
+    fast_float_ensemble_->from_symmetric_ensemble(*this);
+    fast_float_prepared_ = true;
+}
+
+void SymmetricEnsemble::predict_batch_raw_fast(const Float* data, Index n_samples, FeatureIndex n_features, Float* output) const {
+    if (trees_.empty()) {
+        std::memset(output, 0, n_samples * sizeof(Float));
+        return;
+    }
+
+    // Prepare cached fast float ensemble
+    prepare_fast_float_ensemble();
+
+    if (fast_float_ensemble_ && !fast_float_ensemble_->empty()) {
+        // Use the optimized path with automatic transpose for large batches
+        fast_float_ensemble_->predict_batch_with_transpose(data, n_samples, n_features, output);
+    } else {
+        // Fallback to original implementation
+        predict_batch_raw(data, n_samples, n_features, output);
+    }
 }
 
 void SymmetricEnsemble::predict_multiclass(const Dataset& data, Index row, Float* output) const {
@@ -443,6 +1049,52 @@ std::vector<Float> SymmetricEnsemble::feature_importance() const {
     }
 
     return total;
+}
+
+// ============================================================================
+// SymmetricTree Serialization
+// ============================================================================
+
+void SymmetricTree::save(std::ostream& out) const {
+    // Write depth
+    out.write(reinterpret_cast<const char*>(&depth_), sizeof(depth_));
+
+    // Write splits
+    for (const auto& split : splits_) {
+        out.write(reinterpret_cast<const char*>(&split.feature), sizeof(split.feature));
+        out.write(reinterpret_cast<const char*>(&split.threshold), sizeof(split.threshold));
+        out.write(reinterpret_cast<const char*>(&split.float_threshold), sizeof(split.float_threshold));
+        out.write(reinterpret_cast<const char*>(&split.gain), sizeof(split.gain));
+    }
+
+    // Write leaf values
+    size_t n_leaves = leaf_values_.size();
+    out.write(reinterpret_cast<const char*>(&n_leaves), sizeof(n_leaves));
+    out.write(reinterpret_cast<const char*>(leaf_values_.data()), n_leaves * sizeof(Float));
+}
+
+SymmetricTree SymmetricTree::load(std::istream& in) {
+    SymmetricTree tree;
+
+    // Read depth
+    in.read(reinterpret_cast<char*>(&tree.depth_), sizeof(tree.depth_));
+
+    // Read splits
+    tree.splits_.resize(tree.depth_);
+    for (uint16_t d = 0; d < tree.depth_; ++d) {
+        in.read(reinterpret_cast<char*>(&tree.splits_[d].feature), sizeof(tree.splits_[d].feature));
+        in.read(reinterpret_cast<char*>(&tree.splits_[d].threshold), sizeof(tree.splits_[d].threshold));
+        in.read(reinterpret_cast<char*>(&tree.splits_[d].float_threshold), sizeof(tree.splits_[d].float_threshold));
+        in.read(reinterpret_cast<char*>(&tree.splits_[d].gain), sizeof(tree.splits_[d].gain));
+    }
+
+    // Read leaf values
+    size_t n_leaves;
+    in.read(reinterpret_cast<char*>(&n_leaves), sizeof(n_leaves));
+    tree.leaf_values_.resize(n_leaves);
+    in.read(reinterpret_cast<char*>(tree.leaf_values_.data()), n_leaves * sizeof(Float));
+
+    return tree;
 }
 
 } // namespace turbocat

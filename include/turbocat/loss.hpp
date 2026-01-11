@@ -362,6 +362,149 @@ private:
 };
 
 // ============================================================================
+// Asymmetric Loss (Recall/Precision Control)
+//
+// Allows controlling the tradeoff between recall and precision:
+// L = -alpha * y * log(p) - (1-alpha) * (1-y) * log(1-p)
+//
+// alpha > 0.5: higher recall (penalize FN more)
+// alpha < 0.5: higher precision (penalize FP more)
+// alpha = 0.5: standard logloss
+// ============================================================================
+
+class AsymmetricLoss : public Loss {
+public:
+    // alpha controls recall/precision tradeoff
+    // gamma_pos, gamma_neg: focal parameters for positive/negative class
+    explicit AsymmetricLoss(Float alpha = 0.5f, Float gamma_pos = 0.0f, Float gamma_neg = 0.0f)
+        : alpha_(alpha), gamma_pos_(gamma_pos), gamma_neg_(gamma_neg) {}
+
+    Float compute_loss(const Float* labels, const Float* predictions, Index n) const override;
+    void compute_gradients(const Float* labels, const Float* predictions,
+                          Float* gradients, Float* hessians, Index n) const override;
+    Float transform_prediction(Float raw) const override;
+    Float init_prediction(const Float* labels, Index n) const override;
+    const char* name() const override { return "Asymmetric"; }
+
+    void set_alpha(Float alpha) { alpha_ = alpha; }
+    Float get_alpha() const { return alpha_; }
+
+    // Set alpha to optimize for target recall
+    void set_target_recall(Float target_recall) {
+        // Higher alpha = higher recall
+        alpha_ = 0.5f + (target_recall - 0.5f) * 0.8f;
+        alpha_ = std::max(0.1f, std::min(0.9f, alpha_));
+    }
+
+private:
+    Float alpha_;      // Weight for positive class (FN penalty)
+    Float gamma_pos_;  // Focal parameter for positive class
+    Float gamma_neg_;  // Focal parameter for negative class
+
+    static Float sigmoid(Float x) {
+        return 1.0f / (1.0f + std::exp(-x));
+    }
+};
+
+// ============================================================================
+// AUC Loss (Pairwise Ranking)
+//
+// Directly optimizes ROC-AUC through pairwise comparisons:
+// L = Σ_{i∈pos, j∈neg} log(1 + exp(-(s_i - s_j)))
+//
+// This is differentiable and compatible with gradient boosting.
+// ============================================================================
+
+class AUCLoss : public Loss {
+public:
+    explicit AUCLoss(Float margin = 1.0f) : margin_(margin) {}
+
+    Float compute_loss(const Float* labels, const Float* predictions, Index n) const override;
+    void compute_gradients(const Float* labels, const Float* predictions,
+                          Float* gradients, Float* hessians, Index n) const override;
+    Float transform_prediction(Float raw) const override;
+    Float init_prediction(const Float* labels, Index n) const override;
+    const char* name() const override { return "AUCLoss"; }
+
+    void set_margin(Float m) { margin_ = m; }
+
+private:
+    Float margin_;  // Margin for pairwise comparisons
+
+    // Cache indices for efficient gradient computation
+    mutable std::vector<Index> pos_indices_;
+    mutable std::vector<Index> neg_indices_;
+
+    void update_indices(const Float* labels, Index n) const;
+
+    static Float sigmoid(Float x) {
+        return 1.0f / (1.0f + std::exp(-x));
+    }
+};
+
+// ============================================================================
+// Class-Balanced Loss
+//
+// Weights samples inversely proportional to class frequency:
+// w_c = 1 / n_c^beta  (effective number of samples)
+//
+// Or using effective number: w_c = (1 - beta) / (1 - beta^n_c)
+// ============================================================================
+
+class ClassBalancedLoss : public Loss {
+public:
+    explicit ClassBalancedLoss(Float beta = 0.9999f) : beta_(beta) {}
+
+    Float compute_loss(const Float* labels, const Float* predictions, Index n) const override;
+    void compute_gradients(const Float* labels, const Float* predictions,
+                          Float* gradients, Float* hessians, Index n) const override;
+    Float transform_prediction(Float raw) const override;
+    Float init_prediction(const Float* labels, Index n) const override;
+    const char* name() const override { return "ClassBalanced"; }
+
+    // Set weights from class counts
+    void set_class_counts(Index pos_count, Index neg_count);
+
+    // Set weights directly
+    void set_weights(Float pos_weight, Float neg_weight);
+
+private:
+    Float beta_;
+    Float pos_weight_ = 1.0f;
+    Float neg_weight_ = 1.0f;
+
+    static Float sigmoid(Float x) {
+        return 1.0f / (1.0f + std::exp(-x));
+    }
+};
+
+// ============================================================================
+// PR-AUC Loss (Precision-Recall AUC)
+//
+// Optimizes PR-AUC which is better for imbalanced datasets than ROC-AUC.
+// Uses weighted pairwise ranking with focus on positive class.
+// ============================================================================
+
+class PRAUCLoss : public Loss {
+public:
+    explicit PRAUCLoss(Float margin = 1.0f) : margin_(margin) {}
+
+    Float compute_loss(const Float* labels, const Float* predictions, Index n) const override;
+    void compute_gradients(const Float* labels, const Float* predictions,
+                          Float* gradients, Float* hessians, Index n) const override;
+    Float transform_prediction(Float raw) const override;
+    Float init_prediction(const Float* labels, Index n) const override;
+    const char* name() const override { return "PRAUCLoss"; }
+
+private:
+    Float margin_;
+
+    static Float sigmoid(Float x) {
+        return 1.0f / (1.0f + std::exp(-x));
+    }
+};
+
+// ============================================================================
 // Loss Factory
 // ============================================================================
 
@@ -405,7 +548,23 @@ inline std::unique_ptr<Loss> Loss::create(const LossConfig& config, TaskType tas
         
         case LossType::Tsallis:
             return std::make_unique<TsallisLoss>(config.focal_gamma);  // reuse gamma as q
-        
+
+        case LossType::Asymmetric:
+            return std::make_unique<AsymmetricLoss>(
+                config.focal_alpha,      // Use alpha for asymmetry
+                config.focal_gamma,      // gamma_pos
+                config.focal_gamma       // gamma_neg
+            );
+
+        case LossType::AUCLoss:
+            return std::make_unique<AUCLoss>(1.0f);
+
+        case LossType::ClassBalanced:
+            return std::make_unique<ClassBalancedLoss>(0.9999f);
+
+        case LossType::PRAUCLoss:
+            return std::make_unique<PRAUCLoss>(1.0f);
+
         default:
             return std::make_unique<LogLoss>();
     }

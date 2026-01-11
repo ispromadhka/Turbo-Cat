@@ -12,6 +12,7 @@
 
 #include "types.hpp"
 #include "config.hpp"
+#include "feature_orderings.hpp"
 #include <vector>
 #include <string>
 #include <unordered_map>
@@ -59,6 +60,16 @@ public:
     // Prepare row-major layout for prediction
     void prepare_for_prediction() const;
     bool has_row_major() const { return !row_major_data_.empty(); }
+
+    // Prepare column-major layout for SIMD prediction (same as internal storage)
+    // This is a no-op since data is already column-major, but ensures it's ready
+    void prepare_column_major() const { /* Data is already column-major */ }
+    bool has_column_major() const { return !data_.empty(); }
+
+    // Access from column-major layout (same as get(), for SIMD prediction)
+    BinIndex get_column_major(Index row, FeatureIndex feature) const {
+        return data_[feature * n_rows_ + row];
+    }
 
     Index n_rows() const { return n_rows_; }
     FeatureIndex n_features() const { return n_features_; }
@@ -126,14 +137,32 @@ public:
      * Apply precomputed bins from another dataset (for test data)
      */
     void apply_bins(const Dataset& reference);
-    
+
+    /**
+     * Add a new feature to the dataset (for interaction features)
+     * @param values Feature values for each sample
+     * @param type Feature type (Numerical or Categorical)
+     */
+    void add_feature(const std::vector<Float>& values, FeatureType type = FeatureType::Numerical);
+
     // ========================================================================
     // Gradient/Hessian Management
     // ========================================================================
     
     void set_gradients(const AlignedVector<Float>& grads, const AlignedVector<Float>& hess);
     void set_gradients(AlignedVector<Float>&& grads, AlignedVector<Float>&& hess);
-    
+
+    // Fast copy from raw pointers (avoids reallocating internal vectors)
+    void set_gradients_copy(const Float* grads, const Float* hess, Index n_samples);
+
+    // Ensure gradient arrays are allocated (for direct write)
+    void ensure_gradients_allocated(Index n_samples) {
+        if (gradients_.size() != static_cast<size_t>(n_samples)) {
+            gradients_.resize(n_samples);
+            hessians_.resize(n_samples);
+        }
+    }
+
     const Float* gradients() const { return gradients_.data(); }
     const Float* hessians() const { return hessians_.data(); }
     Float* gradients() { return gradients_.data(); }
@@ -150,7 +179,11 @@ public:
     
     Index n_samples() const { return n_samples_; }
     FeatureIndex n_features() const { return n_features_; }
-    
+
+    // Setters for fast prediction path (when binned data is set directly)
+    void set_n_samples(Index n) { n_samples_ = n; }
+    void set_n_features(FeatureIndex n) { n_features_ = n; }
+
     const BinnedData& binned() const { return binned_data_; }
     BinnedData& binned() { return binned_data_; }
     
@@ -162,15 +195,48 @@ public:
     const std::vector<FeatureInfo>& feature_info() const { return feature_info_; }
     const FeatureInfo& feature_info(FeatureIndex f) const { return feature_info_[f]; }
     
-    bool is_categorical(FeatureIndex f) const { 
-        return feature_info_[f].type == FeatureType::Categorical; 
+    bool is_categorical(FeatureIndex f) const {
+        return feature_info_[f].type == FeatureType::Categorical;
     }
-    
+
+    // Categorical features list
+    const std::vector<FeatureIndex>& categorical_features() const {
+        return categorical_features_;
+    }
+
+    // Global target statistics for categorical encoding (used for test data)
+    const std::vector<std::unordered_map<Index, Float>>& target_stats() const {
+        return target_stats_;
+    }
+
+    // Check if target stats have been computed for a feature
+    bool has_target_stats(FeatureIndex f) const {
+        return f < target_stats_.size() && !target_stats_[f].empty();
+    }
+
+    // Get encoded value for a category using global target statistics
+    Float encode_category(FeatureIndex f, Index category, Float prior = 0.5f) const {
+        if (f < target_stats_.size()) {
+            auto it = target_stats_[f].find(category);
+            if (it != target_stats_[f].end()) {
+                return it->second;
+            }
+        }
+        return prior;  // Unknown category falls back to prior
+    }
+
     // Raw unbinned data (for GradTree optimization)
     const Float* raw_data() const { return raw_data_.data(); }
     Float raw_value(Index row, FeatureIndex feature) const {
         return raw_data_[row * n_features_ + feature];
     }
+
+    // Bin edges (for fast prediction without rebinning)
+    const std::vector<std::vector<Float>>& bin_edges() const { return bin_edges_; }
+
+    // Pre-sorted feature orderings (for fast histogram building)
+    const FeatureOrderings& orderings() const { return orderings_; }
+    bool has_orderings() const { return orderings_.is_computed(); }
     
     // ========================================================================
     // Subsampling Support
@@ -192,6 +258,15 @@ public:
      * Simple random row subsample
      */
     std::vector<Index> random_subsample(Float ratio, uint64_t seed) const;
+
+    /**
+     * MVS (Minimum Variance Sampling) - CatBoost-style
+     * Better than GOSS for large datasets, maintains gradient variance
+     * @param subsample_ratio Fraction of samples to keep
+     * @param seed Random seed
+     * @return Subsample indices with adjusted weights
+     */
+    SubsampleIndices mvs_subsample(Float subsample_ratio, uint64_t seed) const;
     
     /**
      * Random column subsample
@@ -208,9 +283,28 @@ public:
     void compute_target_statistics(const Config& config);
     
     /**
-     * Get encoded value for categorical feature
+     * Get encoded value for categorical feature (for test data)
      */
     Float get_categorical_encoding(FeatureIndex feature, Index category) const;
+
+    /**
+     * Get per-sample encoding for categorical feature (for training with ordered/CV stats)
+     */
+    Float get_sample_categorical_encoding(FeatureIndex feature, Index sample_idx) const {
+        if (feature < ordered_cat_encodings_.size() &&
+            sample_idx < ordered_cat_encodings_[feature].size()) {
+            return ordered_cat_encodings_[feature][sample_idx];
+        }
+        return 0.0f;
+    }
+
+    /**
+     * Check if per-sample encodings are available
+     */
+    bool has_ordered_encodings() const {
+        return !ordered_cat_encodings_.empty() &&
+               !ordered_cat_encodings_[0].empty();
+    }
     
     // ========================================================================
     // Statistics
@@ -259,16 +353,27 @@ private:
     // Target statistics for categorical encoding
     // Map: feature_idx -> (category -> encoded_value)
     std::vector<std::unordered_map<Index, Float>> target_stats_;
-    
+
+    // Per-sample categorical encodings (for ordered/CV target statistics)
+    // Map: feature_idx -> (sample_idx -> encoded_value)
+    std::vector<std::vector<Float>> ordered_cat_encodings_;
+
     // Bin edges for numerical features
     std::vector<std::vector<Float>> bin_edges_;
-    
+
     // Missing value indicators
     AlignedVector<uint8_t> missing_mask_;  // Bit-packed
-    
+
+    // Pre-sorted feature orderings for fast histogram building
+    FeatureOrderings orderings_;
+
     // Helper methods
     void detect_feature_types();
     void compute_quantile_bins(FeatureIndex feature, BinIndex n_bins);
+
+    // Categorical encoding methods
+    void compute_ordered_target_statistics(Float prior, Float prior_weight);
+    void compute_cv_target_statistics(uint8_t n_folds, Float prior, Float prior_weight);
     BinIndex find_bin(Float value, const std::vector<Float>& edges) const;
 };
 

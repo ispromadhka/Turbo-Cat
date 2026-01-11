@@ -22,8 +22,9 @@
 
 namespace turbocat {
 
-// Forward declaration
+// Forward declarations
 class FastEnsemble;
+class FastFloatEnsemble;
 
 // ============================================================================
 // Symmetric Tree Structure
@@ -31,7 +32,8 @@ class FastEnsemble;
 
 struct SymmetricSplit {
     FeatureIndex feature = 0;
-    BinIndex threshold = 0;
+    BinIndex threshold = 0;      // Bin threshold (for binned prediction)
+    Float float_threshold = 0.0f; // Raw float threshold (for direct prediction)
     Float gain = 0.0f;
 };
 
@@ -54,8 +56,13 @@ public:
     Float predict(const Dataset& dataset, Index row) const;
     Float predict(const Float* features, FeatureIndex n_features) const;
 
-    // Batch prediction with SIMD
+    // Batch prediction with SIMD (requires binned data)
     void predict_batch(const Dataset& dataset, Float* output) const;
+
+    // Raw float prediction - skips binning entirely
+    // Uses float_threshold for direct comparisons (like CatBoost)
+    Float predict_raw(const Float* features, FeatureIndex n_features) const;
+    void predict_batch_raw(const Float* data, Index n_samples, FeatureIndex n_features, Float* output) const;
 
     // Tree info
     uint16_t depth() const { return depth_; }
@@ -67,6 +74,17 @@ public:
     // Accessors for FastEnsemble
     const std::vector<SymmetricSplit>& splits() const { return splits_; }
     const std::vector<Float>& leaf_values() const { return leaf_values_; }
+
+    // Serialization
+    void save(std::ostream& out) const;
+    static SymmetricTree load(std::istream& in);
+
+    // For deserialization - set tree data directly
+    void set_data(uint16_t depth, std::vector<SymmetricSplit> splits, std::vector<Float> leaves) {
+        depth_ = depth;
+        splits_ = std::move(splits);
+        leaf_values_ = std::move(leaves);
+    }
 
 private:
     TreeConfig config_;
@@ -92,6 +110,26 @@ private:
         const std::vector<std::vector<Index>>& node_samples,  // samples per node at this level
         const std::vector<GradientPair>& node_stats,          // stats per node
         HistogramBuilder& hist_builder
+    );
+
+    /**
+     * Find best split with histogram caching for subtraction trick
+     */
+    SymmetricSplit find_best_level_split_with_histograms(
+        const Dataset& dataset,
+        const std::vector<std::vector<Index>>& node_samples,
+        const std::vector<GradientPair>& node_stats,
+        HistogramBuilder& hist_builder,
+        std::vector<Histogram>& out_histograms  // Output: histograms for this level
+    );
+
+    /**
+     * Find best split from pre-built histograms (for histogram subtraction trick)
+     */
+    SymmetricSplit find_best_split_from_histograms(
+        const Dataset& dataset,
+        const std::vector<Histogram>& histograms,
+        const std::vector<GradientPair>& node_stats
     );
 
     /**
@@ -127,9 +165,16 @@ public:
     void add_tree(std::unique_ptr<SymmetricTree> tree, Float weight = 1.0f);
     void add_tree_for_class(std::unique_ptr<SymmetricTree> tree, Float weight, uint32_t class_idx);
 
-    // Binary/regression prediction
+    // Binary/regression prediction (requires binned data)
     Float predict(const Dataset& data, Index row) const;
     void predict_batch(const Dataset& data, Float* output) const;
+
+    // Raw float prediction - skips binning entirely (like CatBoost)
+    void predict_batch_raw(const Float* data, Index n_samples, FeatureIndex n_features, Float* output) const;
+
+    // FASTEST raw float prediction - uses cached flat tree data + optional transpose
+    // This is the recommended method for production inference without binning
+    void predict_batch_raw_fast(const Float* data, Index n_samples, FeatureIndex n_features, Float* output) const;
 
     // Multiclass prediction
     void predict_multiclass(const Dataset& data, Index row, Float* output) const;
@@ -148,15 +193,22 @@ public:
     // Prepare fast ensemble for optimized prediction
     void prepare_fast_ensemble() const;
 
+    // Prepare fast float ensemble for optimized raw prediction (no binning)
+    void prepare_fast_float_ensemble() const;
+
 private:
     std::vector<std::unique_ptr<SymmetricTree>> trees_;
     std::vector<Float> tree_weights_;
     std::vector<uint32_t> tree_class_indices_;
     uint32_t n_classes_ = 1;
 
-    // Cached fast ensemble for SIMD prediction
+    // Cached fast ensemble for SIMD prediction (binned data)
     mutable bool fast_prepared_ = false;
     mutable std::unique_ptr<FastEnsemble> fast_ensemble_;
+
+    // Cached fast float ensemble for SIMD prediction (raw float data, no binning)
+    mutable bool fast_float_prepared_ = false;
+    mutable std::unique_ptr<FastFloatEnsemble> fast_float_ensemble_;
 };
 
 } // namespace turbocat

@@ -96,7 +96,24 @@ public:
         const std::vector<FeatureIndex>& feature_indices,
         Histogram& output
     ) = 0;
-    
+
+    /**
+     * OPTIMIZED: Build histogram using a range in an index array (no copy)
+     * @param dataset The dataset with binned features and gradients
+     * @param indices Array containing sample indices
+     * @param start Start position in indices array
+     * @param end End position in indices array (exclusive)
+     * @param feature_indices Features to build histograms for (empty = all)
+     * @param output Output histogram to populate
+     */
+    virtual void build_range(
+        const Dataset& dataset,
+        const Index* indices,
+        size_t start, size_t end,
+        const std::vector<FeatureIndex>& feature_indices,
+        Histogram& output
+    ) = 0;
+
     // Factory
     static std::unique_ptr<HistogramBuilder> create(const DeviceConfig& config);
 };
@@ -122,7 +139,15 @@ public:
         const std::vector<FeatureIndex>& feature_indices,
         Histogram& output
     ) override;
-    
+
+    void build_range(
+        const Dataset& dataset,
+        const Index* indices,
+        size_t start, size_t end,
+        const std::vector<FeatureIndex>& feature_indices,
+        Histogram& output
+    ) override;
+
 private:
     int n_threads_;
     bool use_simd_;

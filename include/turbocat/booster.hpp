@@ -173,6 +173,56 @@ public:
      * Predict from raw features (no binning required)
      */
     Float predict_single(const Float* features, FeatureIndex n_features) const;
+
+    /**
+     * Fast batch prediction from raw features (row-major data)
+     * Bins data inline without copying
+     */
+    void predict_raw_fast(
+        const Float* data,       // row-major: data[sample * n_features + feature]
+        Index n_samples,
+        FeatureIndex n_features,
+        Float* output
+    ) const;
+
+    /**
+     * Fastest batch prediction - no binning required!
+     * Uses raw float thresholds stored in trees for direct comparison.
+     * Only works with symmetric trees (use_symmetric=true).
+     * This matches CatBoost's prediction approach for maximum speed.
+     */
+    void predict_raw_nobinning(
+        const Float* data,       // row-major: data[sample * n_features + feature]
+        Index n_samples,
+        FeatureIndex n_features,
+        Float* output
+    ) const;
+
+    /**
+     * FASTEST batch prediction - no binning + cached flat tree data + SIMD transpose!
+     * This is the recommended method for production inference.
+     * Uses cached FastFloatEnsemble with column-major transpose for optimal SIMD.
+     * Only works with symmetric trees (use_symmetric=true).
+     */
+    void predict_raw_nobinning_fast(
+        const Float* data,       // row-major: data[sample * n_features + feature]
+        Index n_samples,
+        FeatureIndex n_features,
+        Float* output
+    ) const;
+
+    /**
+     * FASTEST probability prediction - no binning + cached flat tree data + SIMD!
+     * This is the recommended method for classifier production inference.
+     * Calls predict_raw_nobinning_fast and applies sigmoid transformation.
+     * Only works with symmetric trees (use_symmetric=true).
+     */
+    void predict_proba_nobinning_fast(
+        const Float* data,       // row-major: data[sample * n_features + feature]
+        Index n_samples,
+        FeatureIndex n_features,
+        Float* output
+    ) const;
     
     // ========================================================================
     // Model Information
@@ -256,6 +306,12 @@ private:
     
     // Random state
     uint64_t rng_state_;
+
+    // Reusable buffers to avoid per-iteration allocations
+    mutable AlignedVector<Float> grad_buffer_;
+    mutable AlignedVector<Float> hess_buffer_;
+    mutable std::vector<Float> tree_pred_buffer_;
+    mutable std::vector<Float> valid_pred_buffer_;  // Buffer for validation tree predictions
     
     // ========================================================================
     // Internal Methods

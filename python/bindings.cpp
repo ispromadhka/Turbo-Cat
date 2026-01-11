@@ -9,8 +9,11 @@
 #include <pybind11/stl.h>
 #include <cstring>
 #include <set>
+#include <chrono>
 
 #include "turbocat/turbocat.hpp"
+#include "turbocat/metrics.hpp"
+#include "turbocat/interactions.hpp"
 
 namespace py = pybind11;
 using namespace turbocat;
@@ -34,12 +37,12 @@ py::array_t<T> vector_to_numpy(const std::vector<T>& vec) {
 class TurboCatClassifier {
 public:
     TurboCatClassifier(
-        int n_estimators = 1000,
-        float learning_rate = 0.1f,
+        int n_estimators = 500,          // Optimized: fewer trees, higher LR
+        float learning_rate = 0.2f,      // Optimized: faster convergence
         int max_depth = 6,
         int max_bins = 255,
-        float subsample = 0.8f,
-        float colsample_bytree = 0.8f,
+        float subsample = 1.0f,      // Default: no subsampling (faster training)
+        float colsample_bytree = 1.0f,  // Default: use all features
         float min_child_weight = 1.0f,
         float lambda_l2 = 1.0f,
         const std::string& loss = "auto",
@@ -52,6 +55,11 @@ public:
         const std::string& grow_policy = "depthwise",  // "depthwise" or "lossguide"
         const std::string& mode = "auto",  // "small", "large", or "auto"
         int early_stopping_rounds = 50,
+        const std::string& early_stopping_metric = "loss",  // "loss", "roc_auc", "pr_auc", "f1"
+        const std::string& cat_encoding = "ordered",  // "ordered", "cv", "onehot"
+        bool auto_interactions = false,  // Auto-detect feature interactions
+        int max_interactions = 10,       // Maximum interactions to detect
+        const std::string& interaction_method = "split",  // "split", "mutual_info", "correlation"
         int n_threads = -1,
         int seed = 42,
         int verbosity = 1
@@ -72,6 +80,7 @@ public:
         config_.tree.use_symmetric = use_symmetric;
         config_.boosting.use_ordered_boosting = use_ordered_boosting;
         config_.boosting.early_stopping_rounds = early_stopping_rounds;
+        config_.boosting.early_stopping_metric = early_stopping_metric;
         config_.device.n_threads = n_threads;
         config_.seed = seed;
         config_.verbosity = verbosity;
@@ -93,6 +102,30 @@ public:
             config_.tree.use_symmetric = false;  // Use regular trees for small data
         }
         // "auto" mode will be handled in fit() based on data size
+
+        // Parse categorical encoding method
+        if (cat_encoding == "ordered" || cat_encoding == "target") {
+            config_.categorical.method = CategoricalConfig::EncodingMethod::TargetStatistics;
+        } else if (cat_encoding == "cv" || cat_encoding == "cross_validated") {
+            config_.categorical.method = CategoricalConfig::EncodingMethod::CrossValidatedTS;
+        } else if (cat_encoding == "onehot" || cat_encoding == "one_hot") {
+            config_.categorical.method = CategoricalConfig::EncodingMethod::OneHot;
+        } else {
+            // Default: ordered target statistics (like CatBoost)
+            config_.categorical.method = CategoricalConfig::EncodingMethod::TargetStatistics;
+        }
+
+        // Parse interaction detection settings
+        config_.interactions.auto_detect = auto_interactions;
+        config_.interactions.max_interactions = max_interactions;
+
+        if (interaction_method == "split" || interaction_method == "split_based") {
+            config_.interactions.method = InteractionConfig::DetectionMethod::SplitBased;
+        } else if (interaction_method == "mutual_info" || interaction_method == "mi") {
+            config_.interactions.method = InteractionConfig::DetectionMethod::MutualInfo;
+        } else if (interaction_method == "correlation" || interaction_method == "corr") {
+            config_.interactions.method = InteractionConfig::DetectionMethod::Correlation;
+        }
     }
 
     void fit(
@@ -116,15 +149,13 @@ public:
         FeatureIndex n_features = static_cast<FeatureIndex>(X_buf.shape[1]);
 
         // Handle "auto" mode - choose tree type based on dataset size
-        // "small" data: regular trees (best quality, faster training)
-        // "large" data: symmetric trees (faster inference with bit-ops)
+        // "small" data: regular trees (best quality)
+        // "large" data: symmetric trees (fastest batch inference with no-binning path)
         if (mode_ == "auto") {
-            // Thresholds for switching to symmetric trees:
-            // - 50K+ samples: symmetric trees for faster inference
-            // - 20K+ samples with 50+ features: symmetric for cache efficiency
-            bool is_large = (n_samples >= 50000) ||
-                           (n_samples >= 20000 && n_features >= 50);
-            config_.tree.use_symmetric = is_large;
+            // Use symmetric trees by default for fast batch inference
+            // Symmetric trees support float_threshold for direct comparisons
+            // This avoids the binning overhead in predict (4-5x speedup)
+            config_.tree.use_symmetric = true;
         }
 
         // Detect number of classes from labels
@@ -151,6 +182,14 @@ public:
                 config_.loss.loss_type = LossType::LogitAdjusted;
             } else if (loss_type_str_ == "tsallis") {
                 config_.loss.loss_type = LossType::Tsallis;
+            } else if (loss_type_str_ == "asymmetric") {
+                config_.loss.loss_type = LossType::Asymmetric;
+            } else if (loss_type_str_ == "auc" || loss_type_str_ == "auc_loss") {
+                config_.loss.loss_type = LossType::AUCLoss;
+            } else if (loss_type_str_ == "class_balanced" || loss_type_str_ == "balanced") {
+                config_.loss.loss_type = LossType::ClassBalanced;
+            } else if (loss_type_str_ == "pr_auc" || loss_type_str_ == "prauc") {
+                config_.loss.loss_type = LossType::PRAUCLoss;
             }
         } else {
             // Multiclass
@@ -175,7 +214,47 @@ public:
             nullptr,
             cat_features_typed
         );
+
+        // Compute categorical encodings BEFORE binning (CatBoost-style)
+        if (!cat_features_typed.empty() &&
+            config_.categorical.method != CategoricalConfig::EncodingMethod::OneHot) {
+            train_data_->compute_target_statistics(config_);
+        }
+
         train_data_->compute_bins(config_);
+
+        // Detect and generate feature interactions
+        if (config_.interactions.auto_detect) {
+            if (config_.verbosity > 0) {
+                std::printf("Detecting feature interactions...\n");
+            }
+
+            InteractionDetector detector;
+            auto interactions = detector.detect(*train_data_, config_.interactions);
+
+            if (!interactions.empty()) {
+                if (config_.verbosity > 0) {
+                    std::printf("Found %zu interactions:\n", interactions.size());
+                    for (size_t i = 0; i < std::min(interactions.size(), size_t(5)); ++i) {
+                        const auto& inter = interactions[i];
+                        std::printf("  Feature %u x Feature %u (score: %.4f)\n",
+                                  inter.feature_a, inter.feature_b, inter.interaction_score);
+                    }
+                }
+
+                // Generate interaction features
+                interaction_generator_ = std::make_unique<InteractionGenerator>();
+                FeatureIndex added = interaction_generator_->generate(
+                    *train_data_, interactions, config_.interactions);
+
+                if (config_.verbosity > 0) {
+                    std::printf("Added %u interaction features\n", added);
+                }
+
+                // Re-bin with new features (only bin the new features)
+                train_data_->compute_bins(config_);
+            }
+        }
 
         // Validation data
         std::unique_ptr<Dataset> valid_data;
@@ -190,6 +269,12 @@ public:
                 static_cast<FeatureIndex>(X_val_buf.shape[1]),
                 static_cast<float*>(y_val_buf.ptr)
             );
+
+            // Apply interaction transformations if they were generated
+            if (interaction_generator_) {
+                interaction_generator_->apply(*valid_data, *train_data_);
+            }
+
             valid_data->apply_bins(*train_data_);
         }
 
@@ -209,12 +294,31 @@ public:
         Index n_samples = static_cast<Index>(X_buf.shape[0]);
         FeatureIndex n_features = static_cast<FeatureIndex>(X_buf.shape[1]);
 
+        // OPTIMIZATION: Use fast no-binning path for binary classification
+        // This avoids Dataset creation, data copy, and binning overhead
+        // Only use slow path if we have interactions or multiclass
+        if (n_classes_ <= 2 && !interaction_generator_) {
+            return predict_proba_nobinning_fast(X);
+        }
+
+        // Slow path: required for multiclass or when we have interactions
+        // If train_data_ is not available (loaded model), fall back to nobinning
+        if (!train_data_) {
+            return predict_proba_nobinning_fast(X);
+        }
+
         Dataset test_data;
         test_data.from_dense(
             static_cast<float*>(X_buf.ptr),
             n_samples,
             n_features
         );
+
+        // Apply interaction transformations if they were generated
+        if (interaction_generator_) {
+            interaction_generator_->apply(test_data, *train_data_);
+        }
+
         test_data.apply_bins(*train_data_);
 
         if (n_classes_ > 2) {
@@ -238,6 +342,43 @@ public:
             }
             return result;
         }
+    }
+
+    // FASTEST probability prediction - no binning + cached flat tree data + SIMD
+    // Only works with symmetric trees (mode='large' or 'auto' for large data)
+    py::array_t<float> predict_proba_nobinning_fast(py::array_t<float> X) {
+        if (!is_fitted_) {
+            throw std::runtime_error("Model not fitted. Call fit() first.");
+        }
+
+        auto X_buf = X.request();
+        Index n_samples = static_cast<Index>(X_buf.shape[0]);
+        FeatureIndex n_features = static_cast<FeatureIndex>(X_buf.shape[1]);
+
+        if (n_classes_ > 2) {
+            // Multiclass: fall back to standard predict_proba for now
+            // TODO: implement predict_proba_multiclass_nobinning_fast
+            return predict_proba(X);
+        }
+
+        // Binary: return (n_samples, 2) for sklearn compatibility
+        std::vector<float> proba_1(n_samples);
+        booster_->predict_proba_nobinning_fast(
+            static_cast<float*>(X_buf.ptr),
+            n_samples,
+            n_features,
+            proba_1.data()
+        );
+
+        auto result = py::array_t<float>({n_samples, static_cast<Index>(2)});
+        auto result_buf = result.request();
+        float* r = static_cast<float*>(result_buf.ptr);
+
+        for (Index i = 0; i < n_samples; ++i) {
+            r[i * 2] = 1.0f - proba_1[i];      // P(class=0)
+            r[i * 2 + 1] = proba_1[i];         // P(class=1)
+        }
+        return result;
     }
 
     py::array_t<int> predict(py::array_t<float> X) {
@@ -301,6 +442,8 @@ public:
 
     void load(const std::string& path) {
         booster_ = std::make_unique<Booster>(Booster::load(path));
+        // Restore n_classes from loaded config
+        n_classes_ = booster_->config().n_classes;
         is_fitted_ = true;
     }
 
@@ -383,6 +526,7 @@ private:
     Config config_;
     std::unique_ptr<Booster> booster_;
     std::unique_ptr<Dataset> train_data_;
+    std::unique_ptr<InteractionGenerator> interaction_generator_;
     std::string loss_type_str_;
     std::string mode_;
     uint32_t n_classes_ = 2;
@@ -396,27 +540,31 @@ private:
 class TurboCatRegressor {
 public:
     TurboCatRegressor(
-        int n_estimators = 1000,
-        float learning_rate = 0.1f,
-        int max_depth = 6,
+        int n_estimators = 500,              // Optimized: fewer trees, higher LR (like classifier)
+        float learning_rate = 0.1f,          // Slightly lower for regression stability
+        int max_depth = 6,                   // Deeper trees for regression (CatBoost default)
         const std::string& loss = "mse",
-        float subsample = 0.8f,
-        float colsample_bytree = 0.8f,
+        const std::string& mode = "auto",   // "small", "large", or "auto"
+        float subsample = 1.0f,              // OPTIMIZED: no subsampling (faster, no quality loss)
+        float colsample_bytree = 1.0f,       // All features for regression
         bool use_goss = false,
         float goss_top_rate = 0.2f,
         float goss_other_rate = 0.1f,
         int early_stopping_rounds = 50,
-        float lambda_l2 = 0.0f,
-        const std::string& grow_policy = "depthwise",  // "depthwise" or "lossguide"
+        float lambda_l2 = 3.0f,              // CatBoost default
+        float min_child_weight = 1.0f,       // Minimum hessian sum
+        int max_leaves = 64,                 // 2^6 = 64 (matching max_depth)
+        const std::string& grow_policy = "depthwise",  // Depthwise is more stable
         int n_threads = -1,
         int seed = 42,
         int verbosity = 1
-    ) {
+    ) : mode_(mode) {
         config_ = Config::regression();
 
         config_.boosting.n_estimators = n_estimators;
         config_.boosting.learning_rate = learning_rate;
         config_.tree.max_depth = max_depth;
+        config_.tree.max_leaves = max_leaves;
         config_.boosting.subsample = subsample;
         config_.boosting.colsample_bytree = colsample_bytree;
         config_.boosting.use_goss = use_goss;
@@ -424,15 +572,27 @@ public:
         config_.boosting.goss_other_rate = goss_other_rate;
         config_.boosting.early_stopping_rounds = early_stopping_rounds;
         config_.tree.lambda_l2 = lambda_l2;
+        config_.tree.min_child_weight = min_child_weight;
         config_.device.n_threads = n_threads;
         config_.seed = seed;
         config_.verbosity = verbosity;
 
-        // Parse grow_policy
+        // Parse mode - controls tree architecture for inference speed
+        // "small" = regular trees (best quality, fast training)
+        // "large" = symmetric trees with bit-ops (fastest inference on large data)
+        // "auto" = automatically select based on dataset size in fit()
+        if (mode == "large") {
+            config_.tree.use_symmetric = true;
+        } else if (mode == "small") {
+            config_.tree.use_symmetric = false;
+        }
+        // "auto" mode will be handled in fit() based on data size
+
+        // Parse grow_policy - depthwise is default for stability
         if (grow_policy == "lossguide" || grow_policy == "leaf" || grow_policy == "leafwise") {
             config_.tree.grow_policy = GrowPolicy::Lossguide;
         } else {
-            config_.tree.grow_policy = GrowPolicy::Depthwise;
+            config_.tree.grow_policy = GrowPolicy::Depthwise;  // Default for stability
         }
 
         if (loss == "mse" || loss == "l2") {
@@ -451,9 +611,18 @@ public:
         Index n_samples = static_cast<Index>(X_buf.shape[0]);
         FeatureIndex n_features = static_cast<FeatureIndex>(X_buf.shape[1]);
 
+        // Handle "auto" mode - choose tree type based on dataset size
+        if (mode_ == "auto") {
+            // Use symmetric trees by default for fast batch inference
+            // Symmetric trees support float_threshold for direct comparisons
+            // This avoids the binning overhead in predict (4-5x speedup)
+            config_.tree.use_symmetric = true;
+        }
+
         if (config_.verbosity > 0) {
-            std::printf("[REGRESSOR] fit() called, n_samples=%u, n_features=%u, n_estimators=%u\n",
-                       n_samples, n_features, config_.boosting.n_estimators);
+            std::printf("[REGRESSOR] fit() called, n_samples=%u, n_features=%u, n_estimators=%u, use_symmetric=%s\n",
+                       n_samples, n_features, config_.boosting.n_estimators,
+                       config_.tree.use_symmetric ? "true" : "false");
             std::fflush(stdout);
         }
 
@@ -482,7 +651,18 @@ public:
         is_fitted_ = true;
     }
     
-    std::vector<float> predict(py::array_t<float> X) {
+    std::vector<float> predict(py::array_t<float> X, bool timing = false) {
+        if (!is_fitted_) {
+            throw std::runtime_error("Model not fitted");
+        }
+
+        // OPTIMIZATION: Always use fast no-binning path for regression
+        // This avoids Dataset creation, data copy, and binning overhead
+        return predict_nobinning_fast(X, timing);
+    }
+
+    // Fast prediction - avoids data copy by binning directly from numpy array
+    std::vector<float> predict_fast(py::array_t<float> X, bool timing = false) {
         if (!is_fitted_) {
             throw std::runtime_error("Model not fitted");
         }
@@ -491,24 +671,87 @@ public:
         Index n_samples = static_cast<Index>(X_buf.shape[0]);
         FeatureIndex n_features = static_cast<FeatureIndex>(X_buf.shape[1]);
 
-        Dataset test_data;
-        test_data.from_dense(
+        auto t0 = std::chrono::high_resolution_clock::now();
+
+        std::vector<float> predictions(n_samples);
+        booster_->predict_raw_fast(
             static_cast<float*>(X_buf.ptr),
             n_samples,
-            n_features
+            n_features,
+            predictions.data()
         );
-        test_data.apply_bins(*train_data_);
 
-        // Use batched prediction with local caching
-        const auto& ensemble = booster_->ensemble();
-        std::vector<float> predictions(n_samples, 0.0f);
+        auto t1 = std::chrono::high_resolution_clock::now();
 
-        ensemble.predict_batch_optimized(test_data, predictions.data(), config_.device.n_threads);
+        if (timing) {
+            double total_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            std::printf("[TIMING] predict_fast total: %.1fms\n", total_ms);
+            std::fflush(stdout);
+        }
 
-        // Add base prediction
-        float base = booster_->base_prediction();
-        for (Index i = 0; i < n_samples; ++i) {
-            predictions[i] += base;
+        return predictions;
+    }
+
+    // No-binning prediction - fastest path using raw float thresholds
+    // Only works with symmetric trees (mode='symmetric')
+    std::vector<float> predict_nobinning(py::array_t<float> X, bool timing = false) {
+        if (!is_fitted_) {
+            throw std::runtime_error("Model not fitted");
+        }
+
+        auto X_buf = X.request();
+        Index n_samples = static_cast<Index>(X_buf.shape[0]);
+        FeatureIndex n_features = static_cast<FeatureIndex>(X_buf.shape[1]);
+
+        auto t0 = std::chrono::high_resolution_clock::now();
+
+        std::vector<float> predictions(n_samples);
+        booster_->predict_raw_nobinning(
+            static_cast<float*>(X_buf.ptr),
+            n_samples,
+            n_features,
+            predictions.data()
+        );
+
+        auto t1 = std::chrono::high_resolution_clock::now();
+
+        if (timing) {
+            double total_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            std::printf("[TIMING] predict_nobinning total: %.1fms\n", total_ms);
+            std::fflush(stdout);
+        }
+
+        return predictions;
+    }
+
+    // FASTEST prediction - no binning + cached flat tree data + SIMD transpose
+    // This is the recommended method for production inference
+    // Only works with symmetric trees (mode='large' or 'auto' with large data)
+    std::vector<float> predict_nobinning_fast(py::array_t<float> X, bool timing = false) {
+        if (!is_fitted_) {
+            throw std::runtime_error("Model not fitted");
+        }
+
+        auto X_buf = X.request();
+        Index n_samples = static_cast<Index>(X_buf.shape[0]);
+        FeatureIndex n_features = static_cast<FeatureIndex>(X_buf.shape[1]);
+
+        auto t0 = std::chrono::high_resolution_clock::now();
+
+        std::vector<float> predictions(n_samples);
+        booster_->predict_raw_nobinning_fast(
+            static_cast<float*>(X_buf.ptr),
+            n_samples,
+            n_features,
+            predictions.data()
+        );
+
+        auto t1 = std::chrono::high_resolution_clock::now();
+
+        if (timing) {
+            double total_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            std::printf("[TIMING] predict_nobinning_fast total: %.1fms\n", total_ms);
+            std::fflush(stdout);
         }
 
         return predictions;
@@ -784,6 +1027,7 @@ private:
     Config config_;
     std::unique_ptr<Booster> booster_;
     std::unique_ptr<Dataset> train_data_;
+    std::string mode_;
     bool is_fitted_ = false;
 };
 
@@ -801,13 +1045,14 @@ PYBIND11_MODULE(_turbocat, m) {
     py::class_<TurboCatClassifier>(m, "TurboCatClassifier")
         .def(py::init<int, float, int, int, float, float, float, float,
                       const std::string&, bool, float, float, bool, bool, bool,
-                      const std::string&, const std::string&, int, int, int, int>(),
-             py::arg("n_estimators") = 1000,
-             py::arg("learning_rate") = 0.1f,
+                      const std::string&, const std::string&, int, const std::string&,
+                      const std::string&, bool, int, const std::string&, int, int, int>(),
+             py::arg("n_estimators") = 500,   // Optimized: fewer trees, higher LR
+             py::arg("learning_rate") = 0.2f, // Optimized: faster convergence
              py::arg("max_depth") = 6,
              py::arg("max_bins") = 255,
-             py::arg("subsample") = 0.8f,
-             py::arg("colsample_bytree") = 0.8f,
+             py::arg("subsample") = 1.0f,         // No subsampling (faster training)
+             py::arg("colsample_bytree") = 1.0f,  // Use all features
              py::arg("min_child_weight") = 1.0f,
              py::arg("lambda_l2") = 1.0f,
              py::arg("loss") = "logloss",
@@ -820,6 +1065,11 @@ PYBIND11_MODULE(_turbocat, m) {
              py::arg("grow_policy") = "depthwise",
              py::arg("mode") = "auto",  // "small", "large", or "auto"
              py::arg("early_stopping_rounds") = 50,
+             py::arg("early_stopping_metric") = "loss",  // "loss", "roc_auc", "pr_auc", "f1"
+             py::arg("cat_encoding") = "ordered",  // "ordered", "cv", "onehot"
+             py::arg("auto_interactions") = false,  // Auto-detect feature interactions
+             py::arg("max_interactions") = 10,      // Maximum interactions to detect
+             py::arg("interaction_method") = "split",  // "split", "mutual_info", "correlation"
              py::arg("n_threads") = -1,
              py::arg("seed") = 42,
              py::arg("verbosity") = 1)
@@ -832,6 +1082,7 @@ PYBIND11_MODULE(_turbocat, m) {
         .def("predict", &TurboCatClassifier::predict,
              py::arg("X"))
         .def("predict_proba", &TurboCatClassifier::predict_proba)
+        .def("predict_proba_nobinning_fast", &TurboCatClassifier::predict_proba_nobinning_fast)
         .def("feature_importance", &TurboCatClassifier::feature_importance)
         .def("save", &TurboCatClassifier::save)
         .def("load", &TurboCatClassifier::load)
@@ -844,25 +1095,31 @@ PYBIND11_MODULE(_turbocat, m) {
     
     // Regressor
     py::class_<TurboCatRegressor>(m, "TurboCatRegressor")
-        .def(py::init<int, float, int, const std::string&, float, float, bool, float, float, int, float,
-                      const std::string&, int, int, int>(),
-             py::arg("n_estimators") = 1000,
-             py::arg("learning_rate") = 0.1f,
-             py::arg("max_depth") = 6,
+        .def(py::init<int, float, int, const std::string&, const std::string&, float, float, bool, float, float, int, float,
+                      float, int, const std::string&, int, int, int>(),
+             py::arg("n_estimators") = 500,        // Optimized: fewer trees, higher LR
+             py::arg("learning_rate") = 0.1f,       // Slightly lower for regression stability
+             py::arg("max_depth") = 6,              // Deeper trees for regression (CatBoost default)
              py::arg("loss") = "mse",
-             py::arg("subsample") = 0.8f,
-             py::arg("colsample_bytree") = 0.8f,
+             py::arg("mode") = "auto",              // "small", "large", or "auto" for tree architecture
+             py::arg("subsample") = 1.0f,           // No subsampling (faster training)
+             py::arg("colsample_bytree") = 1.0f,    // All features for regression
              py::arg("use_goss") = false,
              py::arg("goss_top_rate") = 0.2f,
              py::arg("goss_other_rate") = 0.1f,
              py::arg("early_stopping_rounds") = 50,
-             py::arg("lambda_l2") = 0.0f,
-             py::arg("grow_policy") = "depthwise",
+             py::arg("lambda_l2") = 3.0f,           // CatBoost default
+             py::arg("min_child_weight") = 1.0f,    // Minimum hessian sum
+             py::arg("max_leaves") = 64,            // 2^6 = 64 (matching max_depth)
+             py::arg("grow_policy") = "depthwise",  // Depthwise is more stable
              py::arg("n_threads") = -1,
              py::arg("seed") = 42,
              py::arg("verbosity") = 1)
         .def("fit", &TurboCatRegressor::fit)
-        .def("predict", &TurboCatRegressor::predict)
+        .def("predict", &TurboCatRegressor::predict, py::arg("X"), py::arg("timing") = false)
+        .def("predict_fast", &TurboCatRegressor::predict_fast, py::arg("X"), py::arg("timing") = false)
+        .def("predict_nobinning", &TurboCatRegressor::predict_nobinning, py::arg("X"), py::arg("timing") = false)
+        .def("predict_nobinning_fast", &TurboCatRegressor::predict_nobinning_fast, py::arg("X"), py::arg("timing") = false)
         .def("debug_info", &TurboCatRegressor::debug_info)
         .def("tree_info", &TurboCatRegressor::tree_info)
         .def("debug_predict", &TurboCatRegressor::debug_predict)
@@ -875,4 +1132,94 @@ PYBIND11_MODULE(_turbocat, m) {
 
     // Utility functions
     m.def("print_info", &print_info, "Print TurboCat library information");
+
+    // ========================================================================
+    // Metrics Module
+    // ========================================================================
+    auto metrics = m.def_submodule("metrics", "Evaluation metrics for TurboCat");
+
+    // MetricType enum
+    py::enum_<MetricType>(metrics, "MetricType")
+        .value("LogLoss", MetricType::LogLoss)
+        .value("Accuracy", MetricType::Accuracy)
+        .value("Precision", MetricType::Precision)
+        .value("Recall", MetricType::Recall)
+        .value("F1", MetricType::F1)
+        .value("ROC_AUC", MetricType::ROC_AUC)
+        .value("PR_AUC", MetricType::PR_AUC)
+        .value("MSE", MetricType::MSE)
+        .value("MAE", MetricType::MAE)
+        .value("RMSE", MetricType::RMSE)
+        .export_values();
+
+    // Classification metrics
+    metrics.def("roc_auc", [](py::array_t<float> y_true, py::array_t<float> y_pred) {
+        auto yt = y_true.unchecked<1>();
+        auto yp = y_pred.unchecked<1>();
+        return Metrics::roc_auc(yt.data(0), yp.data(0), yt.size());
+    }, "Compute ROC-AUC score", py::arg("y_true"), py::arg("y_pred"));
+
+    metrics.def("pr_auc", [](py::array_t<float> y_true, py::array_t<float> y_pred) {
+        auto yt = y_true.unchecked<1>();
+        auto yp = y_pred.unchecked<1>();
+        return Metrics::pr_auc(yt.data(0), yp.data(0), yt.size());
+    }, "Compute PR-AUC score", py::arg("y_true"), py::arg("y_pred"));
+
+    metrics.def("log_loss", [](py::array_t<float> y_true, py::array_t<float> y_pred, float eps) {
+        auto yt = y_true.unchecked<1>();
+        auto yp = y_pred.unchecked<1>();
+        return Metrics::log_loss(yt.data(0), yp.data(0), yt.size(), eps);
+    }, "Compute log loss", py::arg("y_true"), py::arg("y_pred"), py::arg("eps") = 1e-15f);
+
+    metrics.def("accuracy", [](py::array_t<float> y_true, py::array_t<float> y_pred, float threshold) {
+        auto yt = y_true.unchecked<1>();
+        auto yp = y_pred.unchecked<1>();
+        return Metrics::accuracy(yt.data(0), yp.data(0), yt.size(), threshold);
+    }, "Compute accuracy", py::arg("y_true"), py::arg("y_pred"), py::arg("threshold") = 0.5f);
+
+    metrics.def("precision", [](py::array_t<float> y_true, py::array_t<float> y_pred, float threshold) {
+        auto yt = y_true.unchecked<1>();
+        auto yp = y_pred.unchecked<1>();
+        return Metrics::precision(yt.data(0), yp.data(0), yt.size(), threshold);
+    }, "Compute precision", py::arg("y_true"), py::arg("y_pred"), py::arg("threshold") = 0.5f);
+
+    metrics.def("recall", [](py::array_t<float> y_true, py::array_t<float> y_pred, float threshold) {
+        auto yt = y_true.unchecked<1>();
+        auto yp = y_pred.unchecked<1>();
+        return Metrics::recall(yt.data(0), yp.data(0), yt.size(), threshold);
+    }, "Compute recall", py::arg("y_true"), py::arg("y_pred"), py::arg("threshold") = 0.5f);
+
+    metrics.def("f1_score", [](py::array_t<float> y_true, py::array_t<float> y_pred, float threshold) {
+        auto yt = y_true.unchecked<1>();
+        auto yp = y_pred.unchecked<1>();
+        return Metrics::f1_score(yt.data(0), yp.data(0), yt.size(), threshold);
+    }, "Compute F1 score", py::arg("y_true"), py::arg("y_pred"), py::arg("threshold") = 0.5f);
+
+    metrics.def("find_optimal_threshold", [](py::array_t<float> y_true, py::array_t<float> y_pred,
+                                              MetricType metric, int n_thresholds) {
+        auto yt = y_true.unchecked<1>();
+        auto yp = y_pred.unchecked<1>();
+        return Metrics::find_optimal_threshold(yt.data(0), yp.data(0), yt.size(), metric, n_thresholds);
+    }, "Find optimal threshold for a metric",
+       py::arg("y_true"), py::arg("y_pred"),
+       py::arg("metric") = MetricType::F1, py::arg("n_thresholds") = 100);
+
+    // Regression metrics
+    metrics.def("mse", [](py::array_t<float> y_true, py::array_t<float> y_pred) {
+        auto yt = y_true.unchecked<1>();
+        auto yp = y_pred.unchecked<1>();
+        return Metrics::mse(yt.data(0), yp.data(0), yt.size());
+    }, "Compute mean squared error", py::arg("y_true"), py::arg("y_pred"));
+
+    metrics.def("mae", [](py::array_t<float> y_true, py::array_t<float> y_pred) {
+        auto yt = y_true.unchecked<1>();
+        auto yp = y_pred.unchecked<1>();
+        return Metrics::mae(yt.data(0), yp.data(0), yt.size());
+    }, "Compute mean absolute error", py::arg("y_true"), py::arg("y_pred"));
+
+    metrics.def("rmse", [](py::array_t<float> y_true, py::array_t<float> y_pred) {
+        auto yt = y_true.unchecked<1>();
+        auto yp = y_pred.unchecked<1>();
+        return std::sqrt(Metrics::mse(yt.data(0), yp.data(0), yt.size()));
+    }, "Compute root mean squared error", py::arg("y_true"), py::arg("y_pred"));
 }

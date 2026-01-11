@@ -140,6 +140,20 @@ private:
         uint16_t current_depth
     );
 
+    // ULTRA-OPTIMIZED: In-place partitioning with no index copies
+    // Uses a single preallocated index array with range-based access
+    void build_inplace(
+        const Dataset& dataset,
+        std::vector<Index>& indices,  // Working array (modified in-place)
+        size_t start, size_t end,     // Range within indices
+        const std::vector<FeatureIndex>& features,
+        HistogramBuilder& hist_builder,
+        std::vector<Histogram>& hist_pool,
+        int hist_idx,
+        TreeIndex node_idx,
+        uint16_t current_depth
+    );
+
     // Build helpers for multiclass
     void build_recursive_multiclass(
         TreeIndex node_idx,
@@ -414,6 +428,10 @@ public:
 
     // Optimized batch prediction - processes samples in cache-friendly manner
     void predict_batch_optimized(const Dataset& data, Float* output, int n_threads = -1) const;
+
+    // Ultra-fast SIMD prediction (CatBoost-style optimizations)
+    // Uses column-major data, processes 8 samples + 4 trees simultaneously
+    void predict_batch_simd(const Dataset& data, Float* output, int n_threads = -1) const;
 
     // Ultra-fast prediction using decision tables (FlatTree)
     void predict_batch_flat(const Dataset& data, Float* output, int n_threads = -1) const;
