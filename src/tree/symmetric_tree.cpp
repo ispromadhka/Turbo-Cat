@@ -46,55 +46,230 @@ void SymmetricTree::build(
     const Float* hess = dataset.hessians();
     const FeatureIndex n_features = dataset.n_features();
     const BinIndex max_bins = config_.max_bins;
+    const uint16_t max_depth = config_.max_depth;
 
-    // Initialize: all samples in one node (root)
-    std::vector<std::vector<Index>> current_level_samples(1);
-    current_level_samples[0] = sample_indices;
+    // PRE-ALLOCATE ALL MEMORY UPFRONT to avoid repeated allocations
+    // Maximum nodes at any level = 2^max_depth
+    const uint32_t max_nodes = 1u << max_depth;
 
-    std::vector<GradientPair> current_level_stats(1);
-    for (Index idx : sample_indices) {
-        current_level_stats[0].grad += grads[idx];
-        current_level_stats[0].hess += hess[idx];
-        current_level_stats[0].count += 1;
+    // Pre-allocate histogram pools (two pools for ping-pong)
+    // Pool size = max_nodes at max_depth
+    static thread_local std::vector<Histogram> hist_pool_a;
+    static thread_local std::vector<Histogram> hist_pool_b;
+
+    // Resize pools if needed (only grows, never shrinks)
+    if (hist_pool_a.size() < max_nodes) {
+        hist_pool_a.clear();
+        hist_pool_a.reserve(max_nodes);
+        for (uint32_t i = 0; i < max_nodes; ++i) {
+            hist_pool_a.emplace_back(n_features, max_bins);
+        }
+    }
+    if (hist_pool_b.size() < max_nodes) {
+        hist_pool_b.clear();
+        hist_pool_b.reserve(max_nodes);
+        for (uint32_t i = 0; i < max_nodes; ++i) {
+            hist_pool_b.emplace_back(n_features, max_bins);
+        }
     }
 
-    // Keep histograms across levels for HISTOGRAM SUBTRACTION TRICK
-    std::vector<Histogram> current_level_histograms;
+    // Pre-allocate sample index pools (two pools for ping-pong)
+    static thread_local std::vector<std::vector<Index>> samples_pool_a;
+    static thread_local std::vector<std::vector<Index>> samples_pool_b;
+    static thread_local std::vector<GradientPair> stats_pool_a;
+    static thread_local std::vector<GradientPair> stats_pool_b;
+
+    if (samples_pool_a.size() < max_nodes) {
+        samples_pool_a.resize(max_nodes);
+        samples_pool_b.resize(max_nodes);
+    }
+    if (stats_pool_a.size() < max_nodes) {
+        stats_pool_a.resize(max_nodes);
+        stats_pool_b.resize(max_nodes);
+    }
+
+    // Initialize current level (root)
+    auto* current_samples = &samples_pool_a;
+    auto* current_stats = &stats_pool_a;
+    auto* current_histograms = &hist_pool_a;
+    auto* next_samples = &samples_pool_b;
+    auto* next_stats = &stats_pool_b;
+    auto* next_histograms = &hist_pool_b;
+
+    // Clear and initialize root
+    (*current_samples)[0] = sample_indices;  // Copy
+    (*current_stats)[0] = GradientPair{};
+    for (Index idx : sample_indices) {
+        (*current_stats)[0].grad += grads[idx];
+        (*current_stats)[0].hess += hess[idx];
+        (*current_stats)[0].count += 1;
+    }
 
     splits_.clear();
     depth_ = 0;
 
     // Build tree level by level
-    for (uint16_t d = 0; d < config_.max_depth; ++d) {
-        uint32_t n_nodes = 1u << d;
+    for (uint16_t d = 0; d < max_depth; ++d) {
+        const uint32_t n_nodes = 1u << d;
 
         // Check if we should stop
         bool should_stop = true;
         for (uint32_t n = 0; n < n_nodes; ++n) {
-            if (current_level_samples[n].size() >= static_cast<size_t>(config_.min_samples_leaf * 2) &&
-                current_level_stats[n].hess >= config_.min_child_weight * 2) {
+            if ((*current_samples)[n].size() >= static_cast<size_t>(config_.min_samples_leaf * 2) &&
+                (*current_stats)[n].hess >= config_.min_child_weight * 2) {
                 should_stop = false;
                 break;
             }
         }
         if (should_stop) break;
 
-        // Find best split for this level (ONE split for ALL nodes)
-        // If histograms were pre-built via subtraction, use them directly
+        // Find best split - INLINED to avoid creating view vectors
         SymmetricSplit best_split;
-        bool histograms_prebuilt = (current_level_histograms.size() == n_nodes) &&
-                                   (d > 0);  // After first level, histograms are pre-built
-        if (histograms_prebuilt) {
-            // Histograms already built via subtraction, just find best split
-            best_split = find_best_split_from_histograms(
-                dataset, current_level_histograms, current_level_stats
-            );
+        const Float lambda = config_.lambda_l2;
+
+        if (d == 0) {
+            // ROOT LEVEL: Build histogram and find split
+            (*current_histograms)[0].clear();
+            hist_builder.build(dataset, (*current_samples)[0], {}, (*current_histograms)[0]);
+
+            // Find best split from root histogram - PARALLEL over features
+            Float parent_gain = 0.0f;
+            if ((*current_stats)[0].hess > 1e-10f) {
+                parent_gain = ((*current_stats)[0].grad * (*current_stats)[0].grad) / ((*current_stats)[0].hess + lambda);
+            }
+
+            int max_threads = 1;
+            #ifdef _OPENMP
+            max_threads = omp_get_max_threads();
+            #endif
+
+            std::vector<SymmetricSplit> thread_best(max_threads);
+            for (int t = 0; t < max_threads; ++t) {
+                thread_best[t].gain = -1e30f;
+            }
+
+            const GradientPair root_stat = (*current_stats)[0];
+
+            #pragma omp parallel
+            {
+                int tid = 0;
+                #ifdef _OPENMP
+                tid = omp_get_thread_num();
+                #endif
+
+                SymmetricSplit& local_best = thread_best[tid];
+                GradientPair left_sum;
+
+                #pragma omp for nowait schedule(static)
+                for (FeatureIndex f = 0; f < n_features; ++f) {
+                    left_sum = GradientPair{};
+                    const GradientPair* bins = (*current_histograms)[0].bins(f);
+
+                    for (BinIndex b = 0; b < max_bins - 1; ++b) {
+                        left_sum += bins[b];
+                        Float right_grad = root_stat.grad - left_sum.grad;
+                        Float right_hess = root_stat.hess - left_sum.hess;
+
+                        if (left_sum.hess < 1e-10f || right_hess < 1e-10f) continue;
+
+                        Float left_gain = (left_sum.grad * left_sum.grad) / (left_sum.hess + lambda);
+                        Float right_gain = (right_grad * right_grad) / (right_hess + lambda);
+                        Float gain = 0.5f * (left_gain + right_gain - parent_gain);
+
+                        if (gain > local_best.gain) {
+                            local_best.feature = f;
+                            local_best.threshold = b;
+                            local_best.gain = gain;
+                        }
+                    }
+                }
+            }
+
+            best_split.gain = -1e30f;
+            for (int t = 0; t < max_threads; ++t) {
+                if (thread_best[t].gain > best_split.gain) {
+                    best_split = thread_best[t];
+                }
+            }
         } else {
-            // Build histograms and find best split
-            best_split = find_best_level_split_with_histograms(
-                dataset, current_level_samples, current_level_stats, hist_builder,
-                current_level_histograms
-            );
+            // DEEPER LEVELS: Histograms pre-built via subtraction
+            // Find best split across all nodes
+            std::vector<Float> parent_gains(n_nodes);
+            for (uint32_t n = 0; n < n_nodes; ++n) {
+                if ((*current_stats)[n].hess > 1e-10f) {
+                    parent_gains[n] = ((*current_stats)[n].grad * (*current_stats)[n].grad) / ((*current_stats)[n].hess + lambda);
+                }
+            }
+
+            int max_threads = 1;
+            #ifdef _OPENMP
+            max_threads = omp_get_max_threads();
+            #endif
+
+            std::vector<SymmetricSplit> thread_best(max_threads);
+            for (int t = 0; t < max_threads; ++t) {
+                thread_best[t].gain = -1e30f;
+            }
+
+            #pragma omp parallel
+            {
+                int tid = 0;
+                #ifdef _OPENMP
+                tid = omp_get_thread_num();
+                #endif
+
+                SymmetricSplit& local_best = thread_best[tid];
+                std::vector<GradientPair> node_left_sums(n_nodes);
+
+                #pragma omp for nowait schedule(static)
+                for (FeatureIndex f = 0; f < n_features; ++f) {
+                    std::memset(node_left_sums.data(), 0, n_nodes * sizeof(GradientPair));
+
+                    for (BinIndex b = 0; b < max_bins - 1; ++b) {
+                        Float total_gain = 0.0f;
+
+                        for (uint32_t n = 0; n < n_nodes; ++n) {
+                            node_left_sums[n] += (*current_histograms)[n].bins(f)[b];
+
+                            if ((*current_stats)[n].count == 0) continue;
+
+                            const GradientPair& left = node_left_sums[n];
+                            Float right_grad = (*current_stats)[n].grad - left.grad;
+                            Float right_hess = (*current_stats)[n].hess - left.hess;
+
+                            if (left.hess < 1e-10f || right_hess < 1e-10f) continue;
+
+                            Float left_gain = (left.grad * left.grad) / (left.hess + lambda);
+                            Float right_gain = (right_grad * right_grad) / (right_hess + lambda);
+                            total_gain += 0.5f * (left_gain + right_gain - parent_gains[n]);
+                        }
+
+                        if (total_gain > local_best.gain) {
+                            local_best.feature = f;
+                            local_best.threshold = b;
+                            local_best.gain = total_gain;
+                        }
+                    }
+                }
+            }
+
+            best_split.gain = -1e30f;
+            for (int t = 0; t < max_threads; ++t) {
+                if (thread_best[t].gain > best_split.gain) {
+                    best_split = thread_best[t];
+                }
+            }
+        }
+
+        // Look up float threshold
+        const auto& bin_edges = dataset.bin_edges();
+        if (best_split.gain > -1e29f && best_split.feature < bin_edges.size()) {
+            const auto& edges = bin_edges[best_split.feature];
+            if (best_split.threshold < edges.size()) {
+                best_split.float_threshold = edges[best_split.threshold];
+            } else if (!edges.empty()) {
+                best_split.float_threshold = edges.back();
+            }
         }
 
         // Check if split is valid
@@ -102,84 +277,81 @@ void SymmetricTree::build(
             break;
         }
 
-        // Apply split to all nodes
+        // Apply split
         splits_.push_back(best_split);
         depth_ = d + 1;
 
-        // Create next level with HISTOGRAM SUBTRACTION
-        uint32_t next_n_nodes = n_nodes * 2;
-        std::vector<std::vector<Index>> next_level_samples(next_n_nodes);
-        std::vector<GradientPair> next_level_stats(next_n_nodes);
-        std::vector<Histogram> next_level_histograms(next_n_nodes, Histogram(n_features, max_bins));
+        // Prepare next level
+        const uint32_t next_n_nodes = n_nodes * 2;
 
-        // Pre-allocate based on expected distribution
-        size_t expected_per_node = sample_indices.size() / next_n_nodes + 100;
+        // Clear next level stats and samples (parallel)
+        #pragma omp parallel for schedule(static)
         for (uint32_t n = 0; n < next_n_nodes; ++n) {
-            next_level_samples[n].reserve(expected_per_node);
+            (*next_samples)[n].clear();
+            (*next_stats)[n] = GradientPair{};
+            (*next_histograms)[n].clear();
         }
 
         const BinIndex* split_bins = dataset.binned().column(best_split.feature);
         const BinIndex threshold = best_split.threshold;
 
-        // Partition samples
+        // PARALLEL partition: Each parent node is independent
+        // Each thread handles one parent node and its two children
         #pragma omp parallel for schedule(dynamic)
         for (uint32_t n = 0; n < n_nodes; ++n) {
-            uint32_t left_child = n * 2;
-            uint32_t right_child = n * 2 + 1;
+            const uint32_t left_child = n * 2;
+            const uint32_t right_child = n * 2 + 1;
 
-            for (Index idx : current_level_samples[n]) {
-                BinIndex bin = split_bins[idx];
+            // Local stats to avoid false sharing
+            GradientPair left_stat{}, right_stat{};
+
+            for (Index idx : (*current_samples)[n]) {
+                const BinIndex bin = split_bins[idx];
 
                 if (bin == 255 || bin <= threshold) {
-                    next_level_samples[left_child].push_back(idx);
-                    next_level_stats[left_child].grad += grads[idx];
-                    next_level_stats[left_child].hess += hess[idx];
-                    next_level_stats[left_child].count += 1;
+                    (*next_samples)[left_child].push_back(idx);
+                    left_stat.grad += grads[idx];
+                    left_stat.hess += hess[idx];
+                    left_stat.count += 1;
                 } else {
-                    next_level_samples[right_child].push_back(idx);
-                    next_level_stats[right_child].grad += grads[idx];
-                    next_level_stats[right_child].hess += hess[idx];
-                    next_level_stats[right_child].count += 1;
+                    (*next_samples)[right_child].push_back(idx);
+                    right_stat.grad += grads[idx];
+                    right_stat.hess += hess[idx];
+                    right_stat.count += 1;
                 }
             }
+
+            // Write stats once
+            (*next_stats)[left_child] = left_stat;
+            (*next_stats)[right_child] = right_stat;
         }
 
         // HISTOGRAM SUBTRACTION TRICK: Build smaller child, compute larger via subtraction
-        // This saves ~50% of histogram building at deeper levels
         #pragma omp parallel for schedule(dynamic)
         for (uint32_t n = 0; n < n_nodes; ++n) {
-            uint32_t left_child = n * 2;
-            uint32_t right_child = n * 2 + 1;
+            const uint32_t left_child = n * 2;
+            const uint32_t right_child = n * 2 + 1;
 
-            // Determine which child is smaller
-            bool left_is_smaller = next_level_samples[left_child].size() <=
-                                   next_level_samples[right_child].size();
-            uint32_t smaller = left_is_smaller ? left_child : right_child;
-            uint32_t larger = left_is_smaller ? right_child : left_child;
+            const bool left_is_smaller = (*next_samples)[left_child].size() <=
+                                         (*next_samples)[right_child].size();
+            const uint32_t smaller = left_is_smaller ? left_child : right_child;
+            const uint32_t larger = left_is_smaller ? right_child : left_child;
 
             // Build histogram for smaller child only
-            if (!next_level_samples[smaller].empty()) {
-                hist_builder.build(dataset, next_level_samples[smaller], {},
-                                   next_level_histograms[smaller]);
+            if (!(*next_samples)[smaller].empty()) {
+                hist_builder.build(dataset, (*next_samples)[smaller], {},
+                                   (*next_histograms)[smaller]);
             }
 
-            // Compute larger child via subtraction: larger = parent - smaller
-            for (FeatureIndex f = 0; f < n_features; ++f) {
-                const GradientPair* parent_hist = current_level_histograms[n].bins(f);
-                const GradientPair* smaller_hist = next_level_histograms[smaller].bins(f);
-                GradientPair* larger_hist = next_level_histograms[larger].bins(f);
-
-                for (BinIndex b = 0; b < max_bins; ++b) {
-                    larger_hist[b].grad = parent_hist[b].grad - smaller_hist[b].grad;
-                    larger_hist[b].hess = parent_hist[b].hess - smaller_hist[b].hess;
-                    larger_hist[b].count = parent_hist[b].count - smaller_hist[b].count;
-                }
-            }
+            // Compute larger child via subtraction
+            (*next_histograms)[larger].subtract_from(
+                (*current_histograms)[n], (*next_histograms)[smaller]);
         }
 
-        current_level_samples = std::move(next_level_samples);
-        current_level_stats = std::move(next_level_stats);
-        current_level_histograms = std::move(next_level_histograms);
+        // Swap pools
+        std::swap(current_samples, next_samples);
+        std::swap(current_stats, next_stats);
+        std::swap(current_histograms, next_histograms);
     }
 
     // Compute leaf values
@@ -187,8 +359,8 @@ void SymmetricTree::build(
     leaf_values_.resize(n_leaves);
 
     for (uint32_t i = 0; i < n_leaves; ++i) {
-        if (i < current_level_stats.size()) {
-            leaf_values_[i] = compute_leaf_value(current_level_stats[i]);
+        if (i < current_stats->size()) {
+            leaf_values_[i] = compute_leaf_value((*current_stats)[i]);
         } else {
             leaf_values_[i] = 0.0f;
         }
@@ -215,56 +387,23 @@ SymmetricSplit SymmetricTree::find_best_level_split_with_histograms(
         h.clear();
     }
 
-    // OPTIMIZATION: Use pre-sorted feature orderings if available
-    if (dataset.has_orderings()) {
-        // Build sample_to_node mapping
-        std::vector<int32_t> sample_to_node(n_samples, -1);
-        for (uint32_t n = 0; n < n_nodes; ++n) {
-            for (Index idx : node_samples[n]) {
-                sample_to_node[idx] = static_cast<int32_t>(n);
-            }
-        }
-
-        const FeatureOrderings& orderings = dataset.orderings();
-        const Float* grads = dataset.gradients();
-        const Float* hess = dataset.hessians();
-
-        // Build histograms directly without intermediate allocation
-        // Each thread processes a subset of features
-        #pragma omp parallel for schedule(static)
-        for (FeatureIndex f = 0; f < n_features; ++f) {
-            const BinIndex* bins = dataset.binned().column(f);
-            const auto& sorted_idx = orderings.sorted_indices(f);
-
-            // Iterate through samples in sorted order for this feature
-            for (Index pos = 0; pos < n_samples; ++pos) {
-                Index idx = sorted_idx[pos];
-                int32_t node = sample_to_node[idx];
-
-                if (node >= 0) {
-                    BinIndex bin = bins[idx];
-                    GradientPair* hist = out_histograms[node].bins(f);
-                    hist[bin].grad += grads[idx];
-                    hist[bin].hess += hess[idx];
-                    hist[bin].count += 1;
-                }
-            }
+    // Build histograms for each node
+    // OPTIMIZATION: Use parallel histogram building when we have multiple nodes
+    if (n_nodes == 1) {
+        // FAST PATH: Root level - use optimized histogram builder directly
+        if (!node_samples[0].empty()) {
+            hist_builder.build(dataset, node_samples[0], {}, out_histograms[0]);
         }
     } else {
-        // Fallback to original histogram building
-        if (n_nodes == 1) {
-            if (!node_samples[0].empty()) {
-                hist_builder.build(dataset, node_samples[0], {}, out_histograms[0]);
-            }
-        } else {
-            #pragma omp parallel for schedule(dynamic)
-            for (uint32_t n = 0; n < n_nodes; ++n) {
-                if (!node_samples[n].empty()) {
-                    hist_builder.build(dataset, node_samples[n], {}, out_histograms[n]);
-                }
+        // MULTI-NODE PATH: Build histograms for each node in parallel
+        #pragma omp parallel for schedule(dynamic)
+        for (uint32_t n = 0; n < n_nodes; ++n) {
+            if (!node_samples[n].empty()) {
+                hist_builder.build(dataset, node_samples[n], {}, out_histograms[n]);
             }
         }
     }
+    (void)n_samples;  // May be unused when orderings disabled
 
     // Find best split (same logic as find_best_level_split)
     std::vector<Float> parent_gains(n_nodes);
@@ -711,7 +850,9 @@ Float SymmetricTree::predict_raw(const Float* features, FeatureIndex n_features)
         Float val = features[split.feature];
 
         // NaN goes left (like binned prediction), otherwise compare directly
-        bool go_right = !std::isnan(val) && val > split.float_threshold;
+        // Use >= because binning uses upper_bound: bin = count of edges <= value
+        // So bin > threshold iff value >= edge[threshold]
+        bool go_right = !std::isnan(val) && val >= split.float_threshold;
         leaf_idx = (leaf_idx << 1) | (go_right ? 1u : 0u);
     }
 
@@ -738,8 +879,8 @@ void SymmetricTree::predict_batch_raw(const Float* data, Index n_samples, Featur
             const SymmetricSplit& split = splits_[d];
             Float val = row[split.feature];
 
-            // NaN goes left (like binned prediction), otherwise compare directly
-            bool go_right = !std::isnan(val) && val > split.float_threshold;
+            // NaN goes left, otherwise use >= to match binning behavior
+            bool go_right = !std::isnan(val) && val >= split.float_threshold;
             leaf_idx = (leaf_idx << 1) | (go_right ? 1u : 0u);
         }
 
@@ -889,11 +1030,11 @@ void SymmetricEnsemble::predict_batch_raw(const Float* data, Index n_samples, Fe
                 // NaN check: val != val for NaN
                 __m256 v_nan_mask = _mm256_cmp_ps(v_vals, v_vals, _CMP_UNORD_Q);
 
-                // Compare: val > threshold
+                // Compare: val >= threshold (GE to match binning behavior)
                 __m256 v_thresh = _mm256_set1_ps(thresh);
-                __m256 v_cmp = _mm256_cmp_ps(v_vals, v_thresh, _CMP_GT_OQ);
+                __m256 v_cmp = _mm256_cmp_ps(v_vals, v_thresh, _CMP_GE_OQ);
 
-                // Go right if not NaN and > threshold
+                // Go right if not NaN and >= threshold
                 __m256 v_go_right = _mm256_andnot_ps(v_nan_mask, v_cmp);
 
                 // Update indices
@@ -936,7 +1077,7 @@ void SymmetricEnsemble::predict_batch_raw(const Float* data, Index n_samples, Fe
             uint32_t leaf_idx = 0;
             for (uint16_t d = 0; d < depth; ++d) {
                 Float val = row[features[t * max_depth + d]];
-                bool go_right = !std::isnan(val) && val > thresholds[t * max_depth + d];
+                bool go_right = !std::isnan(val) && val >= thresholds[t * max_depth + d];
                 leaf_idx = (leaf_idx << 1) | (go_right ? 1u : 0u);
             }
             sum += weights[t] * leaves[leaf_idx];
@@ -963,7 +1104,7 @@ void SymmetricEnsemble::predict_batch_raw(const Float* data, Index n_samples, Fe
             uint32_t leaf_idx = 0;
             for (uint16_t d = 0; d < depth; ++d) {
                 Float val = row[features[t * max_depth + d]];
-                bool go_right = !std::isnan(val) && val > thresholds[t * max_depth + d];
+                bool go_right = !std::isnan(val) && val >= thresholds[t * max_depth + d];
                 leaf_idx = (leaf_idx << 1) | (go_right ? 1u : 0u);
             }
             sum += weights[t] * leaves[leaf_idx];

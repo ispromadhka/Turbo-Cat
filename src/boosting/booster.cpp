@@ -399,19 +399,20 @@ void Booster::train(
             info.best_iteration = best_iteration_;
             info.elapsed_seconds = std::chrono::duration<double>(
                 iter_end - start_time).count();
-            info.n_trees = ensemble_.n_trees();
-            
+            info.n_trees = config_.tree.use_symmetric ? symmetric_ensemble_.n_trees() : ensemble_.n_trees();
+
             if (!callback(info)) {
                 break;  // Callback requested stop
             }
         }
     }
-    
+
     if (config_.verbosity > 0) {
         auto end_time = std::chrono::high_resolution_clock::now();
         double total_time = std::chrono::duration<double>(end_time - start_time).count();
+        size_t n_trees = config_.tree.use_symmetric ? symmetric_ensemble_.n_trees() : ensemble_.n_trees();
         std::printf("Training completed in %.2fs with %zu trees\n",
-                   total_time, ensemble_.n_trees());
+                   total_time, n_trees);
         std::fflush(stdout);
     }
 }

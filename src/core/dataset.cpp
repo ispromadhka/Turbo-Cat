@@ -319,22 +319,27 @@ void Dataset::compute_quantile_bins(FeatureIndex feature, BinIndex n_bins) {
     
     feature_info_[feature].num_bins = static_cast<BinIndex>(edges.size() + 1);
     feature_info_[feature].bin_edges = edges;
-    
+
     // Bin the data
     for (Index i = 0; i < n_samples_; ++i) {
         Float val = raw_data_[i * n_features_ + feature];
-        
+
         if (std::isnan(val)) {
             binned_data_.set(i, feature, n_bins);  // NaN bin
         } else {
-            binned_data_.set(i, feature, find_bin(val, edges));
+            BinIndex bin = find_bin(val, edges);
+            binned_data_.set(i, feature, bin);
         }
     }
 }
 
 BinIndex Dataset::find_bin(Float value, const std::vector<Float>& edges) const {
     // Binary search for the bin
-    auto it = std::lower_bound(edges.begin(), edges.end(), value);
+    // Use upper_bound: finds first element > value
+    // This ensures values equal to an edge go to the bin BEFORE that edge
+    // Example: edges = [1.0], value = 1 → upper_bound returns end() → bin 1
+    //          edges = [1.0], value = 0 → upper_bound returns 1.0 → bin 0
+    auto it = std::upper_bound(edges.begin(), edges.end(), value);
     return static_cast<BinIndex>(it - edges.begin());
 }
 

@@ -87,24 +87,21 @@ void CPUHistogramBuilder::build(
     // Check if we're using all samples (no subsampling) - use faster dense path
     bool use_all_samples = (sample_indices.size() == static_cast<size_t>(n_samples));
 
-    // SMART AUTO-SELECTION: Row-wise vs Column-wise histogram building
-    // Based on LightGBM research:
-    // - Row-wise: Better for many samples, fewer features, fewer threads
-    // - Column-wise: Better for many features, many threads
-    const size_t actual_samples = use_all_samples ? static_cast<size_t>(n_samples) : sample_indices.size();
-    const size_t n_feats = features_to_process.size();
-    const size_t hist_size = n_feats * max_bins;
-
-    // Row-wise is disabled - column-wise is faster for our use case
-    (void)actual_samples;
-    (void)n_feats;
-    (void)hist_size;
+    // Column-wise histogram building - each thread processes one feature
+    // Cache-efficient because bins[i] access is sequential
 
     if (use_all_samples) {
-        // OPTIMIZED: Feature-parallel histogram building with 8x unrolling
-        // Column-major storage means sequential sample access is cache-efficient
-        #pragma omp parallel for schedule(static) num_threads(n_threads_)
-        for (size_t fi = 0; fi < features_to_process.size(); ++fi) {
+        // Feature-parallel histogram building - best for cache locality
+        // Each feature's bins array is contiguous in memory
+        const size_t n_feats = features_to_process.size();
+
+        // Use fewer threads to reduce overhead when n_features is small
+        const int effective_threads = (n_feats >= 32) ? n_threads_ :
+                                      (n_feats >= 16) ? std::min(n_threads_, 4) :
+                                      (n_feats >= 8) ? std::min(n_threads_, 2) : 1;
+
+        #pragma omp parallel for schedule(static) num_threads(effective_threads)
+        for (size_t fi = 0; fi < n_feats; ++fi) {
             FeatureIndex f = features_to_process[fi];
             const BinIndex* __restrict__ bins = dataset.binned().column(f);
             GradientPair* __restrict__ out = output.bins(f);
@@ -112,7 +109,6 @@ void CPUHistogramBuilder::build(
             // 8x unrolled loop for better ILP
             Index i = 0;
             for (; i + 8 <= n_samples; i += 8) {
-                // Prefetch ahead
                 __builtin_prefetch(&bins[i + 64], 0, 3);
                 __builtin_prefetch(&gradients[i + 64], 0, 3);
 
@@ -128,7 +124,6 @@ void CPUHistogramBuilder::build(
                 out[b6].grad += gradients[i+6]; out[b6].hess += hessians[i+6]; out[b6].count++;
                 out[b7].grad += gradients[i+7]; out[b7].hess += hessians[i+7]; out[b7].count++;
             }
-            // Remainder
             for (; i < n_samples; ++i) {
                 const BinIndex b = bins[i];
                 out[b].grad += gradients[i];

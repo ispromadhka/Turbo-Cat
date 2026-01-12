@@ -129,7 +129,7 @@ inline Float FastFloatEnsemble::predict_single(const Float* sample, size_t tree_
     for (uint16_t d = 0; d < depth; ++d) {
         Float val = sample[tree_features[d]];
         // NaN goes left (same as binned prediction)
-        bool go_right = !std::isnan(val) && val > tree_thresholds[d];
+        bool go_right = !std::isnan(val) && val >= tree_thresholds[d];
         leaf_idx = (leaf_idx << 1) | (go_right ? 1u : 0u);
     }
 
@@ -204,7 +204,7 @@ inline void FastFloatEnsemble::predict_batch_row_major(
 
                     // Compare: val > threshold
                     __m256 v_thresh = _mm256_set1_ps(thresh);
-                    __m256 v_cmp = _mm256_cmp_ps(v_vals, v_thresh, _CMP_GT_OQ);
+                    __m256 v_cmp = _mm256_cmp_ps(v_vals, v_thresh, _CMP_GE_OQ);
 
                     // Go right if not NaN and > threshold
                     __m256 v_go_right = _mm256_andnot_ps(v_nan_mask, v_cmp);
@@ -257,7 +257,7 @@ inline void FastFloatEnsemble::predict_batch_row_major(
                 }
                 __m256 v_vals = _mm256_load_ps(vals);
                 __m256 v_nan_mask = _mm256_cmp_ps(v_vals, v_vals, _CMP_UNORD_Q);
-                __m256 v_cmp = _mm256_cmp_ps(v_vals, _mm256_set1_ps(thresh), _CMP_GT_OQ);
+                __m256 v_cmp = _mm256_cmp_ps(v_vals, _mm256_set1_ps(thresh), _CMP_GE_OQ);
                 __m256 v_go_right = _mm256_andnot_ps(v_nan_mask, v_cmp);
                 indices = _mm256_slli_epi32(indices, 1);
                 indices = _mm256_or_si256(indices, _mm256_and_si256(_mm256_castps_si256(v_go_right), _mm256_set1_epi32(1)));
@@ -318,7 +318,7 @@ inline void FastFloatEnsemble::predict_batch_row_major(
 
                 // Compare: val > threshold
                 float32x4_t v_thresh = vdupq_n_f32(thresh);
-                uint32x4_t cmp = vcgtq_f32(v_vals, v_thresh);
+                uint32x4_t cmp = vcgeq_f32(v_vals, v_thresh);
 
                 // Go right if not NaN and > threshold
                 uint32x4_t go_right = vbicq_u32(cmp, nan_mask);
@@ -417,7 +417,7 @@ inline void FastFloatEnsemble::predict_batch_column_major(
                     __m256 v_vals = _mm256_loadu_ps(feat_data);
 
                     __m256 v_nan_mask = _mm256_cmp_ps(v_vals, v_vals, _CMP_UNORD_Q);
-                    __m256 v_cmp = _mm256_cmp_ps(v_vals, _mm256_set1_ps(tree_thresholds[d]), _CMP_GT_OQ);
+                    __m256 v_cmp = _mm256_cmp_ps(v_vals, _mm256_set1_ps(tree_thresholds[d]), _CMP_GE_OQ);
                     __m256 v_go_right = _mm256_andnot_ps(v_nan_mask, v_cmp);
 
                     indices = _mm256_slli_epi32(indices, 1);
@@ -439,7 +439,7 @@ inline void FastFloatEnsemble::predict_batch_column_major(
                     __m256 v_vals = _mm256_loadu_ps(feat_data);
 
                     __m256 v_nan_mask = _mm256_cmp_ps(v_vals, v_vals, _CMP_UNORD_Q);
-                    __m256 v_cmp = _mm256_cmp_ps(v_vals, _mm256_set1_ps(tree_thresholds[d]), _CMP_GT_OQ);
+                    __m256 v_cmp = _mm256_cmp_ps(v_vals, _mm256_set1_ps(tree_thresholds[d]), _CMP_GE_OQ);
                     __m256 v_go_right = _mm256_andnot_ps(v_nan_mask, v_cmp);
 
                     indices = _mm256_slli_epi32(indices, 1);
@@ -461,7 +461,7 @@ inline void FastFloatEnsemble::predict_batch_column_major(
                     __m256 v_vals = _mm256_loadu_ps(feat_data);
 
                     __m256 v_nan_mask = _mm256_cmp_ps(v_vals, v_vals, _CMP_UNORD_Q);
-                    __m256 v_cmp = _mm256_cmp_ps(v_vals, _mm256_set1_ps(tree_thresholds[d]), _CMP_GT_OQ);
+                    __m256 v_cmp = _mm256_cmp_ps(v_vals, _mm256_set1_ps(tree_thresholds[d]), _CMP_GE_OQ);
                     __m256 v_go_right = _mm256_andnot_ps(v_nan_mask, v_cmp);
 
                     indices = _mm256_slli_epi32(indices, 1);
@@ -483,7 +483,7 @@ inline void FastFloatEnsemble::predict_batch_column_major(
                     __m256 v_vals = _mm256_loadu_ps(feat_data);
 
                     __m256 v_nan_mask = _mm256_cmp_ps(v_vals, v_vals, _CMP_UNORD_Q);
-                    __m256 v_cmp = _mm256_cmp_ps(v_vals, _mm256_set1_ps(tree_thresholds[d]), _CMP_GT_OQ);
+                    __m256 v_cmp = _mm256_cmp_ps(v_vals, _mm256_set1_ps(tree_thresholds[d]), _CMP_GE_OQ);
                     __m256 v_go_right = _mm256_andnot_ps(v_nan_mask, v_cmp);
 
                     indices = _mm256_slli_epi32(indices, 1);
@@ -520,7 +520,7 @@ inline void FastFloatEnsemble::predict_batch_column_major(
                 const Float* feat_data = data + tree_features[d] * n_samples + base;
                 __m256 v_vals = _mm256_loadu_ps(feat_data);
                 __m256 v_nan_mask = _mm256_cmp_ps(v_vals, v_vals, _CMP_UNORD_Q);
-                __m256 v_cmp = _mm256_cmp_ps(v_vals, _mm256_set1_ps(tree_thresholds[d]), _CMP_GT_OQ);
+                __m256 v_cmp = _mm256_cmp_ps(v_vals, _mm256_set1_ps(tree_thresholds[d]), _CMP_GE_OQ);
                 __m256 v_go_right = _mm256_andnot_ps(v_nan_mask, v_cmp);
                 indices = _mm256_slli_epi32(indices, 1);
                 indices = _mm256_or_si256(indices, _mm256_and_si256(_mm256_castps_si256(v_go_right), _mm256_set1_epi32(1)));
@@ -551,7 +551,7 @@ inline void FastFloatEnsemble::predict_batch_column_major(
             uint32_t leaf_idx = 0;
             for (uint16_t d = 0; d < depth; ++d) {
                 Float val = data[tree_features[d] * n_samples + i];
-                bool go_right = !std::isnan(val) && val > tree_thresholds[d];
+                bool go_right = !std::isnan(val) && val >= tree_thresholds[d];
                 leaf_idx = (leaf_idx << 1) | (go_right ? 1u : 0u);
             }
             sum += weights_[t] * tree_leaves[leaf_idx];
@@ -586,8 +586,8 @@ inline void FastFloatEnsemble::predict_batch_column_major(
 
                 uint32x4_t nan_mask0 = vmvnq_u32(vceqq_f32(v0, v0));
                 uint32x4_t nan_mask1 = vmvnq_u32(vceqq_f32(v1, v1));
-                uint32x4_t cmp0 = vcgtq_f32(v0, thresh);
-                uint32x4_t cmp1 = vcgtq_f32(v1, thresh);
+                uint32x4_t cmp0 = vcgeq_f32(v0, thresh);
+                uint32x4_t cmp1 = vcgeq_f32(v1, thresh);
                 uint32x4_t go_right0 = vbicq_u32(cmp0, nan_mask0);
                 uint32x4_t go_right1 = vbicq_u32(cmp1, nan_mask1);
 
@@ -631,7 +631,7 @@ inline void FastFloatEnsemble::predict_batch_column_major(
             uint32_t leaf_idx = 0;
             for (uint16_t d = 0; d < depth; ++d) {
                 Float val = data[tree_features[d] * n_samples + i];
-                bool go_right = !std::isnan(val) && val > tree_thresholds[d];
+                bool go_right = !std::isnan(val) && val >= tree_thresholds[d];
                 leaf_idx = (leaf_idx << 1) | (go_right ? 1u : 0u);
             }
             sum += weights_[t] * tree_leaves[leaf_idx];
@@ -653,7 +653,7 @@ inline void FastFloatEnsemble::predict_batch_column_major(
             uint32_t leaf_idx = 0;
             for (uint16_t d = 0; d < depth; ++d) {
                 Float val = data[tree_features[d] * n_samples + i];
-                bool go_right = !std::isnan(val) && val > tree_thresholds[d];
+                bool go_right = !std::isnan(val) && val >= tree_thresholds[d];
                 leaf_idx = (leaf_idx << 1) | (go_right ? 1u : 0u);
             }
             sum += weights_[t] * tree_leaves[leaf_idx];
