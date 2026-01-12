@@ -88,7 +88,7 @@ pip install .
 
 ```python
 import turbocat
-print(turbocat.__version__)  # Should print 0.3.0
+print(turbocat.__version__)  # Should print 0.4.2
 ```
 
 ---

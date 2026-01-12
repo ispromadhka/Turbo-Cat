@@ -11,7 +11,7 @@
 
 TurboCat is a high-performance C++ gradient boosting library with Python bindings, implementing cutting-edge research techniques: GradTree (AAAI 2024), Robust Focal Loss, Tsallis entropy splitting, SIMD-optimized gradients, and symmetric trees with no-binning inference.
 
-[![Version](https://img.shields.io/badge/version-0.4.0-blue.svg)](https://github.com/ispromadhka/Turbo-Cat)
+[![Version](https://img.shields.io/badge/version-0.4.2-blue.svg)](https://github.com/ispromadhka/Turbo-Cat)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
@@ -294,7 +294,7 @@ INFERENCE: 30-64x faster    QUALITY: Comparable    TurboCat WINS on Speed
 
 TurboCat — высокопроизводительная библиотека градиентного бустинга на C++ с Python-привязками, реализующая современные техники: GradTree (AAAI 2024), Robust Focal Loss, Tsallis entropy, SIMD-оптимизированные градиенты и симметричные деревья с no-binning инференсом.
 
-[![Version](https://img.shields.io/badge/version-0.4.0-blue.svg)](https://github.com/ispromadhka/Turbo-Cat)
+[![Version](https://img.shields.io/badge/version-0.4.2-blue.svg)](https://github.com/ispromadhka/Turbo-Cat)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 

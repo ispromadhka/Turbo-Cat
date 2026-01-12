@@ -79,9 +79,7 @@ else:
 
 setup(
     name="turbocat",
-    version="0.1.0",
-    author="TurboCat Contributors",
-    author_email="turbocat@example.com",
+    version="0.4.2",
     description="Next-Generation Gradient Boosting Framework - Outperforms CatBoost on model quality",
     long_description=long_description,
     long_description_content_type="text/markdown",

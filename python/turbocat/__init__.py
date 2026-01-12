@@ -19,7 +19,7 @@ Example:
     >>> predictions = clf.predict_proba(X_test)
 """
 
-__version__ = "0.3.0"
+__version__ = "0.4.2"
 
 import numpy as np
 
@@ -437,12 +437,13 @@ try:
             self : TurboCatClassifier
                 Fitted estimator.
             """
-            X = np.asarray(X, dtype=np.float32)
-            y = np.asarray(y, dtype=np.float32)
+            # Ensure C-contiguous arrays (critical for correct C++ interop)
+            X = np.ascontiguousarray(np.asarray(X, dtype=np.float32))
+            y = np.ascontiguousarray(np.asarray(y, dtype=np.float32))
 
             if X_val is not None:
-                X_val = np.asarray(X_val, dtype=np.float32)
-                y_val = np.asarray(y_val, dtype=np.float32)
+                X_val = np.ascontiguousarray(np.asarray(X_val, dtype=np.float32))
+                y_val = np.ascontiguousarray(np.asarray(y_val, dtype=np.float32))
             else:
                 X_val = np.array([], dtype=np.float32).reshape(0, X.shape[1] if X.ndim > 1 else 0)
                 y_val = np.array([], dtype=np.float32)
@@ -467,7 +468,7 @@ try:
             proba : ndarray of shape (n_samples, n_classes)
                 Class probabilities.
             """
-            X = np.asarray(X, dtype=np.float32)
+            X = np.ascontiguousarray(np.asarray(X, dtype=np.float32))
             proba = self._model.predict_proba(X)
             return np.asarray(proba, dtype=np.float32)
 
@@ -489,7 +490,7 @@ try:
             proba : ndarray of shape (n_samples, n_classes)
                 Class probabilities.
             """
-            X = np.asarray(X, dtype=np.float32)
+            X = np.ascontiguousarray(np.asarray(X, dtype=np.float32))
             proba = self._model.predict_proba_nobinning_fast(X)
             return np.asarray(proba, dtype=np.float32)
 
@@ -682,17 +683,11 @@ try:
 
         def fit(self, X, y):
             """Fit the regressor."""
-            X = np.asarray(X, dtype=np.float32)
-            y = np.asarray(y, dtype=np.float32)
-
-            if self._params['verbosity'] > 0:
-                print(f"[PY-DEBUG] fit() called: X.shape={X.shape}, y.shape={y.shape}")
-                print(f"[PY-DEBUG] y stats: min={y.min():.4f}, max={y.max():.4f}, mean={y.mean():.4f}, std={y.std():.4f}")
+            # Ensure C-contiguous arrays (critical for correct C++ interop)
+            X = np.ascontiguousarray(np.asarray(X, dtype=np.float32))
+            y = np.ascontiguousarray(np.asarray(y, dtype=np.float32))
 
             self._model.fit(X, y)
-
-            if self._params['verbosity'] > 0:
-                print(f"[PY-DEBUG] fit() done: n_trees={self._model.n_trees}, base_prediction={self._model.base_prediction:.6f}")
 
             return self
 
@@ -712,22 +707,8 @@ try:
             y_pred : ndarray of shape (n_samples,)
                 Predicted values.
             """
-            X = np.asarray(X, dtype=np.float32)
-
-            if self._params['verbosity'] > 0:
-                print(f"[PY-DEBUG] predict() called: X.shape={X.shape}")
-                # Check if X has variance (if all same, predictions will be same)
-                x_std = X.std(axis=0)
-                zero_var_features = np.sum(x_std < 1e-6)
-                print(f"[PY-DEBUG] X stats: mean_std={x_std.mean():.4f}, zero_var_features={zero_var_features}")
-
+            X = np.ascontiguousarray(np.asarray(X, dtype=np.float32))
             preds = np.asarray(self._model.predict(X, timing), dtype=np.float32)
-
-            if self._params['verbosity'] > 0:
-                print(f"[PY-DEBUG] predict() done: preds range=[{preds.min():.6f}, {preds.max():.6f}], unique={len(np.unique(preds))}")
-                if len(np.unique(preds)) == 1:
-                    print(f"[PY-DEBUG] WARNING: All predictions identical! This is likely a bug in binning or tree traversal.")
-
             return preds
 
         def predict_fast(self, X, timing=False):
@@ -746,7 +727,7 @@ try:
             y_pred : ndarray of shape (n_samples,)
                 Predicted values.
             """
-            X = np.asarray(X, dtype=np.float32)
+            X = np.ascontiguousarray(np.asarray(X, dtype=np.float32))
             return np.asarray(self._model.predict_fast(X, timing), dtype=np.float32)
 
         def predict_nobinning(self, X, timing=False):
@@ -769,7 +750,7 @@ try:
             y_pred : ndarray of shape (n_samples,)
                 Predicted values.
             """
-            X = np.asarray(X, dtype=np.float32)
+            X = np.ascontiguousarray(np.asarray(X, dtype=np.float32))
             return np.asarray(self._model.predict_nobinning(X, timing), dtype=np.float32)
 
         def predict_nobinning_fast(self, X, timing=False):
@@ -792,7 +773,7 @@ try:
             y_pred : ndarray of shape (n_samples,)
                 Predicted values.
             """
-            X = np.asarray(X, dtype=np.float32)
+            X = np.ascontiguousarray(np.asarray(X, dtype=np.float32))
             return np.asarray(self._model.predict_nobinning_fast(X, timing), dtype=np.float32)
 
         def debug_info(self):
@@ -814,7 +795,7 @@ try:
             - Tree traversal path for first few samples
             - Comparison of train vs test data ranges
             """
-            X = np.asarray(X, dtype=np.float32)
+            X = np.ascontiguousarray(np.asarray(X, dtype=np.float32))
             return self._model.debug_predict(X)
 
         @property
@@ -826,6 +807,10 @@ try:
         def base_prediction_(self):
             """Base prediction (mean for regression)."""
             return self._model.base_prediction
+
+        def feature_importance(self):
+            """Get feature importance scores."""
+            return self._model.feature_importance()
 
         def get_params(self, deep=True):
             """Get parameters (sklearn compatibility)."""
